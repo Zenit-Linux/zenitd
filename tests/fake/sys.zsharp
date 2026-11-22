@@ -1,0 +1,313 @@
+class Sys {
+    public $files = [];
+    public $links = [];
+    public $dirs = ["/" => true];
+    public $now = 1000000;          # ms monotoniczne
+    public $realBase = 1798000000;  # epoch s (2026-12-..)
+    public $nextPid = 100;
+    public $nextFd = 10;
+    public $spawned = [];           # lista specyfikacji
+    public $spawnPids = [];
+    public $alive = [];
+    public $exits = [];             # kolejka [pid, status]
+    public $lastStatus = 0;
+    public $kills = [];
+    public $autoDie = true;
+    public $failSpawn = 0;          # gdy != 0, następny spawn zwraca ten błąd
+    public $reads = [];             # fd => lista porcji
+    public $writes = [];            # fd => dane
+    public $closed = [];
+    public $mounts = [];
+    public $rebooted = "";
+    public $arch = "x86_64";
+    public $hostnameVal = "testhost";
+    public $spawnStage = "";
+    public $users = ["root" => [0, 0, "/root", "/bin/sh"], "daemon" => [1, 1, "/", "/sbin/nologin"], "www" => [33, 33, "/var/www", "/bin/false"]];
+
+    public func __construct() {}
+
+    public func errno() { return 2; }
+    public func errstr($e) { return "błąd " . strval($e); }
+    public $pidVal = 4242;
+    public func pid() { return $this->pidVal; }
+    public func uid() { return 0; }
+    public func ppid() { return 1; }
+    public func isX86() { return true; }
+
+    # ── czas ──
+    public func monoMs() { return $this->now; }
+    public func realMs() { return $this->realBase * 1000 + $this->now; }
+    public func sleepMs($ms) { $this->now += $ms; }
+    public func advance($ms) { $this->now += $ms; }
+
+    func daysFromCivil($y, $m, $d) {
+        if ($m <= 2) { $y -= 1; }
+        $era = intval(($y >= 0 ? $y : $y - 399) / 400);
+        $yoe = $y - $era * 400;
+        $mp = ($m + 9) % 12;
+        $doy = intval((153 * $mp + 2) / 5) + $d - 1;
+        $doe = $yoe * 365 + intval($yoe / 4) - intval($yoe / 100) + $doy;
+        return $era * 146097 + $doe - 719468;
+    }
+    public func mktime($y, $mo, $d, $h, $mi, $s) {
+        $mo0 = $mo - 1;
+        $y += intval($mo0 / 12);
+        $mo0 = $mo0 % 12;
+        if ($mo0 < 0) { $mo0 += 12; $y -= 1; }
+        $days = $this->daysFromCivil($y, $mo0 + 1, 1) + ($d - 1);
+        return $days * 86400 + $h * 3600 + $mi * 60 + $s;
+    }
+    public func tm($sec) {
+        $days = intval($sec / 86400);
+        $rem = $sec - $days * 86400;
+        if ($rem < 0) { $rem += 86400; $days -= 1; }
+        $z = $days + 719468;
+        $era = intval(($z >= 0 ? $z : $z - 146096) / 146097);
+        $doe = $z - $era * 146097;
+        $yoe = intval(($doe - intval($doe / 1460) + intval($doe / 36524) - intval($doe / 146096)) / 365);
+        $y = $yoe + $era * 400;
+        $doy = $doe - (365 * $yoe + intval($yoe / 4) - intval($yoe / 100));
+        $mp = intval((5 * $doy + 2) / 153);
+        $d = $doy - intval((153 * $mp + 2) / 5) + 1;
+        $m = $mp < 10 ? $mp + 3 : $mp - 9;
+        if ($m <= 2) { $y += 1; }
+        $wd = ($days + 4) % 7;
+        if ($wd < 0) { $wd += 7; }
+        return [$y, $m, $d, intval($rem / 3600), intval(($rem % 3600) / 60), $rem % 60, $wd, 0, 0];
+    }
+
+    # ── pliki ──
+    func norm($p) {
+        $parts = [];
+        foreach (split($p, "/") as $x) {
+            if ($x == "" || $x == ".") { continue; }
+            $parts[] = $x;
+        }
+        return "/" . join($parts, "/");
+    }
+    public func addFile($p, $content) {
+        $p = $this->norm($p);
+        $this->files[$p] = $content;
+        $this->ensureParents($p);
+    }
+    func ensureParents($p) {
+        $parts = split($p, "/");
+        $cur = "";
+        $i = 0;
+        while ($i < count($parts) - 1) {
+            if ($parts[$i] != "") { $cur = $cur . "/" . $parts[$i]; $this->dirs[$cur] = true; }
+            $i += 1;
+        }
+    }
+    func resolve($p) {
+        $p = $this->norm($p);
+        $guard = 0;
+        while (($this->links[$p] ?? null) != null && $guard < 8) {
+            $t = $this->links[$p];
+            if (!starts_with($t, "/")) { $t = $this->norm(substr($p, 0, strlen($p) - strlen($this->base($p))) . $t); }
+            $p = $this->norm($t);
+            $guard += 1;
+        }
+        return $p;
+    }
+    func base($p) {
+        $i = strlen($p) - 1;
+        while ($i >= 0 && substr($p, $i, 1) != "/") { $i -= 1; }
+        return substr($p, $i + 1, strlen($p) - $i - 1);
+    }
+    public func stat($p) {
+        $p = $this->norm($p);
+        if (($this->links[$p] ?? null) != null) { return 3; }
+        if (($this->files[$p] ?? null) != null) { return 1; }
+        if (($this->dirs[$p] ?? null) != null) { return 2; }
+        return 0;
+    }
+    public func exists($p) { return $this->stat($p) != 0; }
+    public func isDir($p) { return $this->stat($this->resolve($p)) == 2; }
+    public func readFile($p, $max) {
+        $r = $this->resolve($p);
+        return $this->files[$r] ?? null;
+    }
+    public func writeFile($p, $data, $create) {
+        $p = $this->norm($p);
+        if ($create || ($this->files[$p] ?? null) != null) {
+            $this->files[$p] = $data;
+            $this->ensureParents($p);
+            return strlen($data);
+        }
+        return -2;
+    }
+    public func appendFile($p, $data) {
+        $p = $this->norm($p);
+        $this->files[$p] = ($this->files[$p] ?? "") . $data;
+        $this->ensureParents($p);
+        return strlen($data);
+    }
+    public func size($p) {
+        $r = $this->resolve($p);
+        $c = $this->files[$r] ?? null;
+        if ($c == null) { return -1; }
+        return strlen($c);
+    }
+    public func mtime($p) { return $this->realBase; }
+    public func mkdirp($p, $mode) {
+        $p = $this->norm($p);
+        $this->dirs[$p] = true;
+        $this->ensureParents($p . "/x");
+        return 0;
+    }
+    public func symlink($t, $l) {
+        $l = $this->norm($l);
+        if ($this->stat($l) != 0) { return -17; }
+        $this->links[$l] = $t;
+        $this->ensureParents($l);
+        return 0;
+    }
+    public func readlink($p) { return $this->links[$this->norm($p)] ?? null; }
+    public func unlink($p) {
+        $p = $this->norm($p);
+        $this->links[$p] = null;
+        $this->files[$p] = null;
+        return 0;
+    }
+    public func rmdir($p) {
+        $p = $this->norm($p);
+        $this->dirs[$p] = null;
+        return 0;
+    }
+    public func rename($a, $b) {
+        $a = $this->norm($a); $b = $this->norm($b);
+        $this->files[$b] = $this->files[$a] ?? null;
+        $this->files[$a] = null;
+        return 0;
+    }
+    public func dirList($p) {
+        $p = $this->resolve($p);
+        if (($this->dirs[$p] ?? null) == null) { return null; }
+        $prefix = $p . "/";
+        if ($p == "/") { $prefix = "/"; }
+        $seen = [];
+        $out = [];
+        foreach ([$this->files, $this->links, $this->dirs] as $map) {
+            foreach (keys($map) as $k) {
+                if ($map[$k] == null || !starts_with($k, $prefix) || $k == $p) { continue; }
+                $rest = substr($k, strlen($prefix), strlen($k) - strlen($prefix));
+                $first = split($rest, "/")[0];
+                if ($first != "" && ($seen[$first] ?? null) == null) { $seen[$first] = true; $out[] = $first; }
+            }
+        }
+        return $out;
+    }
+    public func chown($p, $u, $g) { return 0; }
+    public func chmod($p, $m) { return 0; }
+    public func access($p, $m) { return $this->exists($p) ? 0 : -2; }
+    public func mount($s, $t, $f, $fl, $d) { $this->mounts[] = [$s, $t, $f, $fl]; return 0; }
+    public func umount($t, $lazy) { return 0; }
+    public func sync() { }
+
+    # ── procesy ──
+    public func spawn($spec) {
+        if ($this->failSpawn != 0) {
+            $e = $this->failSpawn;
+            $this->failSpawn = 0;
+            $this->spawnStage = "exec";
+            return $e;
+        }
+        $pid = $this->nextPid;
+        $this->nextPid += 1;
+        $this->spawned[] = $spec;
+        $this->spawnPids[] = $pid;
+        $this->alive[$pid] = true;
+        $this->spawnStage = "";
+        return $pid;
+    }
+    public func exitProc($pid, $status) {
+        if (($this->alive[$pid] ?? null) == null) { return 0; }
+        $this->alive[$pid] = null;
+        $this->exits[] = [$pid, $status];
+    }
+    public func kill($pid, $sig) {
+        $this->kills[] = [$pid, $sig];
+        if ($sig == 0) { return ($this->alive[$pid] ?? null) != null ? 0 : -3; }
+        if ($this->autoDie && ($sig == 9 || $sig == 15) && ($this->alive[$pid] ?? null) != null) { $this->exitProc($pid, 256 + $sig); }
+        return 0;
+    }
+    public func alive($pid) { return ($this->alive[$pid] ?? null) != null; }
+    public func subreaper() { return 0; }
+    public func reap() {
+        if (count($this->exits) == 0) { return 0; }
+        $e = $this->exits[0];
+        $rest = [];
+        $i = 0;
+        foreach ($this->exits as $x) { if ($i > 0) { $rest[] = $x; } $i += 1; }
+        $this->exits = $rest;
+        $this->lastStatus = $e[1];
+        return $e[0];
+    }
+    public func execv($p, $a) { return -2; }
+    public func lastSpawn() { return $this->spawned[count($this->spawned) - 1]; }
+
+    # ── sygnały / epoll / fd ──
+    public func signalfd($l) { $this->nextFd += 1; return $this->nextFd; }
+    public func signalRead($fd) { return 0; }
+    public func ignoreSigpipe() { }
+    public func epollCreate() { $this->nextFd += 1; return $this->nextFd; }
+    public func epollCtl($ep, $op, $fd, $ev) { return 0; }
+    public func epollWait($ep, $t) { $this->now += $t; return []; }
+    public func open($p, $f) { $this->nextFd += 1; return $this->nextFd; }
+    public func close($fd) { $this->closed[] = $fd; return 0; }
+    public func pushRead($fd, $data) {
+        $l = $this->reads[$fd] ?? [];
+        $l[] = $data;
+        $this->reads[$fd] = $l;
+    }
+    public func read($fd, $max) {
+        $l = $this->reads[$fd] ?? [];
+        if (count($l) == 0) { return ""; }
+        $first = $l[0];
+        if ($first == null) { return null; }
+        $rest = [];
+        $i = 0;
+        foreach ($l as $x) { if ($i > 0) { $rest[] = $x; } $i += 1; }
+        $this->reads[$fd] = $rest;
+        return $first;
+    }
+    public func write($fd, $data) {
+        $this->writes[$fd] = ($this->writes[$fd] ?? "") . $data;
+        return strlen($data);
+    }
+    public func writeAll($fd, $data, $t) { $this->write($fd, $data); return 0; }
+    public func waitReadable($fd, $t) { return 1; }
+    public func pipe() { $this->nextFd += 2; return [$this->nextFd - 1, $this->nextFd]; }
+    public func pipeBlocking() { $this->nextFd += 2; return [$this->nextFd - 1, $this->nextFd]; }
+    public func nonblock($fd) { return 0; }
+    public func isatty($fd) { return false; }
+    public func listenUnix($p, $m, $b) { $this->nextFd += 1; return $this->nextFd; }
+    public func listenTcp($h, $p, $b) { $this->nextFd += 1; return $this->nextFd; }
+    public func bindDgram($p, $m) { $this->nextFd += 1; return $this->nextFd; }
+    public func accept($fd) { return -11; }
+    public $canned = null;
+    public $lastConnect = "";
+    public func connectUnix($p) {
+        $this->lastConnect = $p;
+        if ($this->canned == null) { return -111; }
+        $this->nextFd += 1;
+        $this->pushRead($this->nextFd, $this->canned);
+        return $this->nextFd;
+    }
+    public func connectDgram($p) { return -111; }
+    public func recv($fd) { return $this->read($fd, 65536); }
+    public func peerUid($fd) { return 0; }
+
+    # ── system ──
+    public func reboot($w) { $this->rebooted = $w; return 0; }
+    public func setHostname($n) { $this->hostnameVal = $n; return 0; }
+    public func hostname() { return $this->hostnameVal; }
+    public func userUid($u) { $x = $this->users[$u] ?? null; if ($x == null) { return -1; } return $x[0]; }
+    public func userGid($u) { $x = $this->users[$u] ?? null; if ($x == null) { return -1; } return $x[1]; }
+    public func userHome($u) { $x = $this->users[$u] ?? null; if ($x == null) { return null; } return $x[2]; }
+    public func userShell($u) { $x = $this->users[$u] ?? null; if ($x == null) { return null; } return $x[3]; }
+    public func groupGid($g) { if ($g == "root") { return 0; } if ($g == "www") { return 33; } return -1; }
+    public func console() { return 0; }
+    public func kmsg($m) { return 0; }
+}

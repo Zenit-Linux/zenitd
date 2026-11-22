@@ -1,1 +1,182 @@
+extern "c" {
+    # pamięć i napisy
+    func malloc(int $n): int;
+    func free(int $p): int;
+    func memset(int $p, int $c, int $n): int;
+    func memcpy(int $d, string $s, int $n): int;
+    func memcmp(int $a, int $b, int $n): int;
+    func strstr(int $h, string $n): string;
+    func strdup(string $s): int;
+    func strerror(int $e): string;
+    func __errno_location(): int;
 
+    # procesy i sygnały
+    func fork(): int;
+    func _exit(int $c): int;
+    func waitpid(int $pid, int $st, int $opt): int;
+    func kill(int $pid, int $sig): int;
+    func getpid(): int;
+    func getuid(): int;
+    func getppid(): int;
+    func setsid(): int;
+    func umask(int $m): int;
+    func setpriority(int $w, int $who, int $p): int;
+    func chdir(string $p): int;
+    func chroot(string $p): int;
+    func execve(string $p, int $argv, int $envp): int;
+    func prctl(int $o, int $a, int $b, int $c, int $d): int;
+    func unshare(int $f): int;
+    func setrlimit(int $r, int $p): int;
+    func signal(int $s, int $h): int;
+    func sigemptyset(int $s): int;
+    func sigaddset(int $s, int $n): int;
+    func sigprocmask(int $how, int $set, int $old): int;
+    func signalfd(int $fd, int $mask, int $flags): int;
+    func setresuid(int $r, int $e, int $s): int;
+    func setresgid(int $r, int $e, int $s): int;
+    func setgroups(int $n, int $list): int;
+    func initgroups(string $user, int $gid): int;
+    func syscall(int $n, int $a, int $b, int $c, int $d): int;
+
+    # deskryptory
+    func open(string $p, int $flags, int $mode): int;
+    func close(int $fd): int;
+    func read(int $fd, int $buf, int $n): int;
+    func write(int $fd, string $s, int $n): int;
+    func pipe2(int $fds, int $flags): int;
+    func fcntl(int $fd, int $cmd, int $arg): int;
+    func dup2(int $a, int $b): int;
+    func isatty(int $fd): int;
+    func poll(int $fds, int $n, int $timeout): int;
+    func ioctl(int $fd, int $req, int $arg): int;
+    func epoll_create1(int $flags): int;
+    func epoll_ctl(int $ep, int $op, int $fd, int $ev): int;
+    func epoll_wait(int $ep, int $evs, int $max, int $timeout): int;
+
+    # gniazda
+    func socket(int $d, int $t, int $p): int;
+    func bind(int $fd, int $addr, int $len): int;
+    func listen(int $fd, int $backlog): int;
+    func accept4(int $fd, int $a, int $l, int $flags): int;
+    func connect(int $fd, int $addr, int $len): int;
+    func send(int $fd, string $s, int $n, int $flags): int;
+    func recv(int $fd, int $buf, int $n, int $flags): int;
+    func setsockopt(int $fd, int $lvl, int $opt, int $val, int $len): int;
+    func getsockopt(int $fd, int $lvl, int $opt, int $val, int $len): int;
+    func inet_pton(int $af, string $src, int $dst): int;
+
+    # system plików
+    func mkdir(string $p, int $mode): int;
+    func symlink(string $t, string $l): int;
+    func readlink(string $p, int $buf, int $n): int;
+    func unlink(string $p): int;
+    func rmdir(string $p): int;
+    func rename(string $a, string $b): int;
+    func opendir(string $p): int;
+    func readdir(int $d): int;
+    func closedir(int $d): int;
+    func chown(string $p, int $uid, int $gid): int;
+    func chmod(string $p, int $mode): int;
+    func access(string $p, int $mode): int;
+    func lstat(string $p, int $buf): int;
+    func mount(string $src, string $tgt, string $fs, int $flags, string $data): int;
+    func umount2(string $t, int $flags): int;
+    func sync(): int;
+    func reboot(int $cmd): int;
+
+    # system, czas, użytkownicy
+    func sethostname(string $n, int $len): int;
+    func gethostname(int $buf, int $len): int;
+    func getpwnam(string $n): int;
+    func getgrnam(string $n): int;
+    func nanosleep(int $req, int $rem): int;
+    func clock_gettime(int $clk, int $ts): int;
+    func localtime_r(int $t, int $tm): int;
+    func mktime(int $tm): int;
+}
+
+import Workspace.sys;
+import Workspace.util;
+import Workspace.config;
+import Workspace.boot;
+import Workspace.manager;
+import Workspace.compat;
+
+func argv0($sys) {
+    $c = $sys->readFile("/proc/self/cmdline", 4096);
+    if ($c == null) { return "zenitd"; }
+    # NUL-e w cmdline zamieniono na spacje — pierwszy token to argv[0]
+    $first = split(trim($c), " ")[0];
+    return util.basename($first);
+}
+
+func envMap() {
+    $m = [];
+    foreach (["HOME", "XDG_RUNTIME_DIR", "container", "TERM", "USER"] as $k) {
+        $v = System.env($k);
+        if ($v != null) { $m[$k] = $v; }
+    }
+    return $m;
+}
+
+func daemonUsage() {
+    return "zenitd [--user|--system] [--unit=CEL] [--version]\n"
+        . "  Jako PID 1 uruchamia system. Poza PID 1 działa jako menedżer usług (kontener, sesja użytkownika).\n"
+        . "  Aplety (symlinki): zenitctl systemctl journalctl reboot poweroff halt shutdown telinit systemd-notify\n";
+}
+
+func runDaemon($sys, $args) {
+    $mode = "system";
+    $unit = "";
+    foreach ($args as $a) {
+        if ($a == "--user") { $mode = "user"; }
+        elseif ($a == "--system") { $mode = "system"; }
+        elseif (starts_with($a, "--unit=")) { $unit = substr($a, 7, strlen($a) - 7); }
+        elseif ($a == "--version") { necho("zenitd 0.1.0\n"); return 0; }
+        elseif ($a == "--help" || $a == "-h") { necho(daemonUsage()); return 0; }
+        elseif ($a == "--test" || $a == "--deserialize" || starts_with($a, "--log-") || starts_with($a, "--default-standard")) { }
+    }
+    $cfg = config.load($sys, $mode, envMap());
+    $b = new Boot($sys, $cfg);
+    $b->run();
+    $m = new Manager($sys, $cfg);
+    $m->setup();
+    foreach ($b->notes as $n) { $m->warn("rozruch: " . $n); }
+    $target = $b->chooseTarget($m->loader->defaultTarget());
+    if ($unit != "") { $target = util.normalizeName($unit); }
+    $m->startBoot($target);
+    $code = $m->loop();
+    if ($cfg->isPid1) {
+        # PID 1 nigdy nie kończy działania — jeśli pętla zwróciła, czekamy na jądro
+        while (true) { $sys->sleepMs(1000); $m->reapAll(); }
+    }
+    return $code;
+}
+
+func main() {
+    $sys = new Sys();
+    $args = System.args();
+    $name = argv0($sys);
+    if (count($args) > 0 && starts_with($args[0], "--applet=")) {
+        $name = substr($args[0], 9, strlen($args[0]) - 9);
+        $args = util.drop_first($args);
+    }
+    if ($sys->pid() == 1 || $name == "zenitd" || $name == "init" || starts_with($name, "zenitd-")) {
+        return runDaemon($sys, $args);
+    }
+    $mode = "system";
+    $rest = [];
+    foreach ($args as $a) {
+        if ($a == "--user") { $mode = "user"; }
+        $rest[] = $a;
+    }
+    $cfg = config.load($sys, $mode, envMap());
+    $rc = compat.dispatch($sys, $cfg, $name, $rest);
+    if ($rc < 0) {
+        eecho("zenitd: nieznany aplet '" . $name . "'. Użyj: zenitd, zenitctl, systemctl, journalctl, reboot, poweroff, halt, shutdown, telinit, systemd-notify");
+        return 2;
+    }
+    return $rc;
+}
+
+exit(main());

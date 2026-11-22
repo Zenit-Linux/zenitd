@@ -1,0 +1,59 @@
+import Workspace.sys;
+import Workspace.util;
+import Workspace.loader;
+import Workspace.graph;
+import Workspace.config;
+import Workspace.manager;
+
+func eq($name, $got, $want) {
+    if ($got == $want) { echo "ok   " . $name; return 0; }
+    echo "FAIL " . $name . " got=" . strval($got) . " want=" . strval($want);
+    return 1;
+}
+func pump($m, $n) { $i = 0; while ($i < $n) { $m->iterate(0); $i += 1; } }
+
+$f = 0;
+$s = new Sys();
+$dir = "../data/units";
+$n = 0;
+foreach (Directory.list($dir) as $name) {
+    $s->addFile("/usr/lib/zenit/system/" . $name, File.read($dir . "/" . $name));
+    $n += 1;
+}
+$f += eq("units loaded from data/", $n >= 25, true);
+$s->addFile("/dev/tty1", "x");
+$s->symlink("/usr/lib/zenit/system/multi-user.target", "/etc/zenit/system/default.target");
+$s->mkdirp("/etc/zenit/system/getty.target.wants", 493);
+$s->symlink("/usr/lib/zenit/system/getty@.service", "/etc/zenit/system/getty.target.wants/getty@tty1.service");
+$s->mkdirp("/etc/zenit/system/multi-user.target.wants", 493);
+$s->symlink("/usr/lib/zenit/system/getty.target", "/etc/zenit/system/multi-user.target.wants/getty.target");
+$cfg = config.load($s, "system", ["HOME" => "/root"]);
+$m = new Manager($s, $cfg);
+$m->setup();
+$f += eq("default target", $m->loader->defaultTarget(), "multi-user.target");
+foreach (["multi-user.target", "graphical.target", "rescue.target", "emergency.target", "poweroff.target", "reboot.target", "halt.target"] as $t) {
+    $p = graph.planStart($m, $t);
+    $f += eq("plan " . $t . " errors", count($p["errors"]), 0);
+    $f += eq("plan " . $t . " cycle warnings", count($p["warnings"]), 0);
+}
+$p = graph.planStart($m, "multi-user.target");
+$pos = [];
+$i = 0;
+foreach ($p["start"] as $x) { $pos[$x] = $i; $i += 1; }
+$f += eq("sysinit before basic", $pos["sysinit.target"] < $pos["basic.target"], true);
+$f += eq("remount before mount-local", $pos["zenit-remount-root.service"] < $pos["zenit-mount-local.service"], true);
+$f += eq("getty instance in plan", ($pos["getty@tty1.service"] ?? -1) >= 0, true);
+$f += eq("getty after basic", $pos["basic.target"] < $pos["getty@tty1.service"], true);
+$g = $m->loader->load("getty@tty1.service");
+$f += eq("getty %I expanded", contains($g->get("Service", "ExecStart", ""), "tty1"), true);
+$f += eq("getty has no unknown-key warnings", count($g->warnings), 0);
+foreach (["udevd.service", "zenit-mount-local.service", "rescue.service"] as $x) {
+    $f += eq($x . " no warnings", count($m->loader->load($x)->warnings), 0);
+}
+# rozruch w kontenerze (warunek ConditionVirtualization=!container): udevd/mount pomijane, cel osiągnięty
+$cfg->container = true;
+$m->startBoot("multi-user.target");
+pump($m, 6);
+$f += eq("container boot reaches target", $m->runtimeFor("multi-user.target")->state, "active");
+$f += eq("udevd skipped in container", $m->runtimeFor("udevd.service")->sub, "condition-failed");
+exit($f);

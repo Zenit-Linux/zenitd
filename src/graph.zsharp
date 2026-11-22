@@ -1,0 +1,206 @@
+namespace graph;
+import Workspace.util;
+
+# domknięcie startu: ["members" => [nazwy w kolejności odkrycia], "weak" => [nazwy tylko przez Wants],
+#                      "requisite" => [[kto, wymaga]], "errors" => [...], "warnings" => [...]]
+func closure($reg, $root) {
+    $members = [];
+    $weak = [];
+    $requisite = [];
+    $errors = [];
+    $warnings = [];
+    $queue = [[$root, false]];
+    $qi = 0;
+    while ($qi < count($queue)) {
+        $item = $queue[$qi];
+        $qi += 1;
+        $n = $item[0];
+        $isWeak = $item[1];
+        if (util.contains_item($members, $n)) {
+            if (!$isWeak) { $weak = util.without($weak, $n); }
+            continue;
+        }
+        $u = $reg->unit($n);
+        if ($u->loadError != "") {
+            if ($n == $root || !$isWeak) {
+                $errors[] = "Jednostka " . $n . " nie może zostać załadowana: " . $u->loadError;
+            } else { $warnings[] = "pominięto " . $n . ": " . $u->loadError; }
+            continue;
+        }
+        $members[] = $n;
+        if ($isWeak) { $weak[] = $n; }
+        foreach ($u->requires as $d) { $queue[] = [$d, $isWeak]; }
+        foreach ($u->bindsTo as $d) { $queue[] = [$d, $isWeak]; }
+        foreach ($u->wants as $d) { $queue[] = [$d, true]; }
+        foreach ($u->requisite as $d) { $requisite[] = [$n, $d]; }
+    }
+    return ["members" => $members, "weak" => $weak, "requisite" => $requisite, "errors" => $errors, "warnings" => $warnings];
+}
+
+# czy węzeł leży na cyklu w grafie poprzedników (tylko wśród nieukończonych)
+func onCycle($preds, $done, $start) {
+    $seen = [$start];
+    $queue = [$start];
+    $qi = 0;
+    while ($qi < count($queue)) {
+        $cur = $queue[$qi];
+        $qi += 1;
+        foreach ($preds[$cur] as $p) {
+            if ($done[$p]) { continue; }
+            if ($p == $start) { return true; }
+            if (!util.contains_item($seen, $p)) { $seen[] = $p; $queue[] = $p; }
+        }
+    }
+    return false;
+}
+
+# Sortowanie topologiczne po After/Before w obrębie $members. Cykle łamane z ostrzeżeniem.
+# Zwraca ["order" => [...], "warnings" => [...]]
+func order($reg, $members) {
+    $n = count($members);
+    $idx = [];
+    $i = 0;
+    while ($i < $n) { $idx[$members[$i]] = $i; $i += 1; }
+    $preds = [];      # preds[i] = lista indeksów, które muszą być przed i
+    $i = 0;
+    while ($i < $n) { $preds[] = []; $i += 1; }
+    $i = 0;
+    while ($i < $n) {
+        $u = $reg->unit($members[$i]);
+        foreach ($u->after as $x) {
+            $j = $idx[$x] ?? null;
+            if ($j != null && $j != $i) { $preds[$i] = util.add_unique($preds[$i], $j); }
+        }
+        foreach ($u->before as $y) {
+            $j = $idx[$y] ?? null;
+            if ($j != null && $j != $i) { $preds[$j] = util.add_unique($preds[$j], $i); }
+        }
+        $i += 1;
+    }
+    $done = [];
+    $i = 0;
+    while ($i < $n) { $done[] = false; $i += 1; }
+    $out = [];
+    $warnings = [];
+    while (count($out) < $n) {
+        $progress = false;
+        $i = 0;
+        while ($i < $n) {
+            if (!$done[$i]) {
+                $ready = true;
+                foreach ($preds[$i] as $p) { if (!$done[$p]) { $ready = false; break; } }
+                if ($ready) { $done[$i] = true; $out[] = $members[$i]; $progress = true; }
+            }
+            $i += 1;
+        }
+        if (!$progress) {
+            # cykl: wymuś węzeł leżący na cyklu o najmniejszej liczbie niespełnionych poprzedników
+            $best = -1;
+            $bestScore = 1000000;
+            $i = 0;
+            while ($i < $n) {
+                if (!$done[$i] && onCycle($preds, $done, $i)) {
+                    $score = 0;
+                    foreach ($preds[$i] as $p) { if (!$done[$p]) { $score += 1; } }
+                    if ($score < $bestScore) { $bestScore = $score; $best = $i; }
+                }
+                $i += 1;
+            }
+            if ($best < 0) {
+                $i = 0;
+                while ($i < $n) { if (!$done[$i]) { $best = $i; break; } $i += 1; }
+            }
+            $warnings[] = "cykl porządku zależności przerwany na " . $members[$best];
+            $done[$best] = true;
+            $out[] = $members[$best];
+        }
+    }
+    return ["order" => $out, "warnings" => $warnings];
+}
+
+# Plan startu. Zwraca:
+#  ["start" => [uporządkowane nazwy], "stop" => [nazwy do zatrzymania z powodu Conflicts],
+#   "weak" => [...], "requisite" => [[kto, wymaga]], "errors" => [...], "warnings" => [...]]
+func planStart($reg, $root) {
+    $c = closure($reg, $root);
+    $plan = ["start" => [], "stop" => [], "weak" => $c["weak"], "requisite" => $c["requisite"],
+             "errors" => $c["errors"], "warnings" => $c["warnings"]];
+    if (count($c["errors"]) > 0) { return $plan; }
+    $members = $c["members"];
+    $stops = [];
+    foreach ($members as $m) {
+        $u = $reg->unit($m);
+        foreach ($u->conflicts as $x) {
+            if (util.contains_item($members, $x)) {
+                $plan["errors"][] = "Transakcja zawiera sprzeczne jednostki: " . $m . " koliduje z " . $x;
+            } else { $stops = util.add_unique($stops, $x); }
+        }
+    }
+    foreach ($reg->loadedUnits() as $o) {
+        if (util.contains_item($members, $o->name)) { continue; }
+        foreach ($o->conflicts as $x) {
+            if (util.contains_item($members, $x)) { $stops = util.add_unique($stops, $o->name); }
+        }
+    }
+    $o = order($reg, $members);
+    $plan["start"] = $o["order"];
+    foreach ($o["warnings"] as $w) { $plan["warnings"][] = $w; }
+    $plan["stop"] = $stops;
+    return $plan;
+}
+
+# jednostki, które trzeba zatrzymać razem z $root (zależności odwrotne: Requires/BindsTo/PartOf)
+func stopClosure($reg, $root) {
+    $members = [$root];
+    $qi = 0;
+    $loaded = $reg->loadedUnits();
+    while ($qi < count($members)) {
+        $cur = $members[$qi];
+        $qi += 1;
+        foreach ($loaded as $o) {
+            if (util.contains_item($members, $o->name)) { continue; }
+            if (util.contains_item($o->requires, $cur) || util.contains_item($o->bindsTo, $cur) || util.contains_item($o->partOf, $cur)) {
+                $members[] = $o->name;
+            }
+        }
+    }
+    return $members;
+}
+
+# Plan stopu: kolejność odwrotna do startowej
+func planStop($reg, $root) {
+    $members = stopClosure($reg, $root);
+    $o = order($reg, $members);
+    $rev = [];
+    $i = count($o["order"]) - 1;
+    while ($i >= 0) { $rev[] = $o["order"][$i]; $i -= 1; }
+    return ["stop" => $rev, "warnings" => $o["warnings"]];
+}
+
+# Dla `list-dependencies`: drzewo zależności jako lista [głębokość, nazwa]
+class TreeAcc {
+    public $out = [];
+    public $seen = [];
+}
+
+func tree($reg, $root, $maxDepth) {
+    $acc = new TreeAcc();
+    treeWalk($reg, $root, 0, $maxDepth, $acc);
+    return $acc->out;
+}
+
+func treeWalk($reg, $name, $depth, $maxDepth, $acc) {
+    $acc->out[] = [$depth, $name];
+    if ($depth >= $maxDepth) { return 0; }
+    $u = $reg->unit($name);
+    $kids = [];
+    foreach ($u->requires as $d) { $kids = util.add_unique($kids, $d); }
+    foreach ($u->wants as $d) { $kids = util.add_unique($kids, $d); }
+    foreach ($u->bindsTo as $d) { $kids = util.add_unique($kids, $d); }
+    foreach ($kids as $k) {
+        if (util.contains_item($acc->seen, $k)) { continue; }
+        $acc->seen[] = $k;
+        treeWalk($reg, $k, $depth + 1, $maxDepth, $acc);
+    }
+    return 0;
+}

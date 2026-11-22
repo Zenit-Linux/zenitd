@@ -1,0 +1,78 @@
+namespace proto;
+import Workspace.util;
+
+func encodeRequest($args) {
+    $parts = [];
+    foreach ($args as $a) { $parts[] = util.escapeField($a); }
+    return join($parts, "\t") . "\n";
+}
+
+func decodeRequest($line) {
+    $out = [];
+    foreach (split($line, "\t") as $p) { $out[] = util.unescapeField($p); }
+    return $out;
+}
+
+func encodeResponse($code, $body) {
+    return strval($code) . "\t" . strval(strlen($body)) . "\n" . $body;
+}
+
+# Bufor żądań serwera: składa linie z kawałków danych
+class ReqBuf {
+    public $buf = "";
+    public $overflow = false;
+
+    public func feed($data) {
+        $this->buf = $this->buf . $data;
+        if (strlen($this->buf) > 1048576) { $this->overflow = true; $this->buf = ""; return []; }
+        $parts = split($this->buf, "\n");
+        $n = count($parts);
+        $out = [];
+        $i = 0;
+        while ($i < $n - 1) {
+            if ($parts[$i] != "") { $out[] = $parts[$i]; }
+            $i += 1;
+        }
+        $this->buf = $parts[$n - 1];
+        return $out;
+    }
+}
+
+# Klient: czyta pełną odpowiedź (blokująco, z limitem czasu na brak aktywności). ["code"=>int,"body"=>str] | null
+func readResponse($sys, $fd, $idleTimeoutMs) {
+    $buf = "";
+    $need = -1;
+    $code = 0;
+    $hdrEnd = -1;
+    while (true) {
+        if ($need < 0) {
+            $nl = index_of($buf, "\n");
+            if ($nl >= 0) {
+                $h = split(substr($buf, 0, $nl), "\t");
+                if (count($h) != 2) { return null; }
+                $code = util.parseInt($h[0], 1);
+                $need = util.parseInt($h[1], 0);
+                $buf = substr($buf, $nl + 1, strlen($buf) - $nl - 1);
+            }
+        }
+        if ($need >= 0 && strlen($buf) >= $need) {
+            return ["code" => $code, "body" => substr($buf, 0, $need)];
+        }
+        $w = $sys->waitReadable($fd, $idleTimeoutMs);
+        if ($w <= 0) { return null; }
+        $d = $sys->read($fd, 65536);
+        if ($d == null) { return null; }
+        $buf = $buf . $d;
+    }
+    return null;
+}
+
+# sd_notify: "READY=1\nSTATUS=ok\n" => ["READY" => "1", "STATUS" => "ok"]
+func parseNotify($data) {
+    $out = [];
+    foreach (split($data, "\n") as $l) {
+        $eq = index_of($l, "=");
+        if ($eq > 0) { $out[substr($l, 0, $eq)] = substr($l, $eq + 1, strlen($l) - $eq - 1); }
+    }
+    return $out;
+}

@@ -1,0 +1,138 @@
+namespace config;
+import Workspace.util;
+import Workspace.ini;
+
+class Config {
+    public $mode = "system";            # system | user
+    public $isPid1 = false;
+    public $container = false;
+    public $unitDirs = [];
+    public $enableDir = "/etc/zenit/system";
+    public $runDir = "/run/zenit";
+    public $controlSock = "/run/zenit/control";
+    public $notifyDir = "/run/zenit/notify";
+    public $devlogSock = "/run/zenit/devlog";
+    public $volatileLogDir = "/run/log/zenit";
+    public $persistLogDir = "/var/log/zenit";
+    public $stateDir = "/var/lib/zenit";
+    public $cgroupBase = "/sys/fs/cgroup";
+    public $cgroupRoot = "/sys/fs/cgroup/zenit.slice";
+    public $defaultTarget = "";
+    public $kernelCmdline = "";
+    public $timeoutStartMs = 90000;
+    public $timeoutStopMs = 90000;
+    public $restartMs = 100;
+    public $startLimitIntervalMs = 10000;
+    public $startLimitBurst = 5;
+    public $shutdownTimeoutMs = 120000;
+    public $logMaxBytes = 16777216;
+    public $logKeep = 4;
+    public $compatSdBooted = false;
+    public $systemdUnits = true;
+    public $defaultEnv = [];
+    public $defaultLimitNofile = "";
+    public $ctrlAltDel = "reboot.target";
+    public $logLevel = 6;
+    public $home = "/root";
+    public $uid = 0;
+
+    public func runDirBase() {
+        if ($this->mode == "user") { return util.dirname($this->runDir); }
+        return "/run";
+    }
+    public func stateBase() {
+        if ($this->mode == "user") { return $this->home . "/.local/state"; }
+        return "/var/lib";
+    }
+    public func cacheBase() {
+        if ($this->mode == "user") { return $this->home . "/.cache"; }
+        return "/var/cache";
+    }
+    public func logsBase() {
+        if ($this->mode == "user") { return $this->home . "/.local/state"; }
+        return "/var/log";
+    }
+    public func confBase() {
+        if ($this->mode == "user") { return $this->home . "/.config"; }
+        return "/etc";
+    }
+}
+
+# zbiera ścieżki jednostek dla trybu systemowego/użytkownika
+func unitDirsFor($mode, $home, $runtimeDir, $systemdCompat) {
+    $d = [];
+    if ($mode == "system") {
+        $d = ["/etc/zenit/system", "/run/zenit/system", "/usr/local/lib/zenit/system", "/usr/lib/zenit/system", "/lib/zenit/system"];
+        if ($systemdCompat) {
+            $d = util.concat($d, ["/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"]);
+        }
+    } else {
+        $d = [$home . "/.config/zenit/user", "/etc/zenit/user", "/usr/lib/zenit/user"];
+        if ($systemdCompat) { $d = util.concat($d, [$home . "/.config/systemd/user", "/etc/systemd/user", "/usr/lib/systemd/user"]); }
+    }
+    return $d;
+}
+
+# Buduje Config. $env: tablica zmiennych środowiskowych (HOME, XDG_RUNTIME_DIR, container)
+func load($sys, $mode, $env) {
+    $c = new Config();
+    $c->mode = $mode;
+    $c->isPid1 = ($sys->pid() == 1);
+    $c->uid = $sys->uid();
+    $c->home = $env["HOME"] ?? "/root";
+    $c->container = ($env["container"] ?? "") != "" || $sys->exists("/run/.containerenv") || $sys->exists("/.dockerenv");
+    $conf = $sys->readFile("/etc/zenit/zenit.conf", 65536);
+    if ($conf != null) {
+        $r = ini.parse($conf);
+        foreach ($r["sections"] as $s) {
+            if ($s["name"] != "Manager") { continue; }
+            foreach ($s["items"] as $it) { applyKey($c, $it[0], $it[1]); }
+        }
+    }
+    if ($mode == "user") {
+        $rt = $env["XDG_RUNTIME_DIR"] ?? ("/run/user/" . strval($c->uid));
+        $c->runDir = $rt . "/zenit";
+        $c->enableDir = $c->home . "/.config/zenit/user";
+        $c->persistLogDir = $c->home . "/.local/state/zenit/log";
+        $c->volatileLogDir = $c->runDir . "/log";
+        $c->stateDir = $c->home . "/.local/state/zenit";
+    }
+    $c->controlSock = $c->runDir . "/control";
+    $c->notifyDir = $c->runDir . "/notify";
+    $c->devlogSock = $c->runDir . "/devlog";
+    $c->unitDirs = unitDirsFor($mode, $c->home, $c->runDir, $c->systemdUnits);
+    return $c;
+}
+
+func applyKey($c, $k, $v) {
+    if ($k == "DefaultTimeoutStartSec") { $t = util.parseTimeMs($v); if ($t != null) { $c->timeoutStartMs = $t; } }
+    elseif ($k == "DefaultTimeoutStopSec") { $t = util.parseTimeMs($v); if ($t != null) { $c->timeoutStopMs = $t; } }
+    elseif ($k == "DefaultRestartSec") { $t = util.parseTimeMs($v); if ($t != null) { $c->restartMs = $t; } }
+    elseif ($k == "DefaultStartLimitIntervalSec") { $t = util.parseTimeMs($v); if ($t != null) { $c->startLimitIntervalMs = $t; } }
+    elseif ($k == "DefaultStartLimitBurst") { $c->startLimitBurst = util.parseInt($v, 5); }
+    elseif ($k == "ShutdownTimeoutSec") { $t = util.parseTimeMs($v); if ($t != null) { $c->shutdownTimeoutMs = $t; } }
+    elseif ($k == "LogMaxFileSize") { $t = util.parseSize($v); if ($t != null && $t > 0) { $c->logMaxBytes = $t; } }
+    elseif ($k == "LogKeepFiles") { $c->logKeep = util.parseInt($v, 4); }
+    elseif ($k == "CompatSdBooted") { $c->compatSdBooted = util.parseBool($v, false); }
+    elseif ($k == "SystemdUnitCompat") { $c->systemdUnits = util.parseBool($v, true); }
+    elseif ($k == "DefaultEnvironment") { $c->defaultEnv = util.concat($c->defaultEnv, util.splitWords($v)); }
+    elseif ($k == "DefaultLimitNOFILE") { $c->defaultLimitNofile = $v; }
+    elseif ($k == "CtrlAltDelUnit") { $c->ctrlAltDel = $v; }
+    elseif ($k == "LogLevel") { $c->logLevel = util.parseInt($v, 6); }
+    elseif ($k == "DefaultTarget") { $c->defaultTarget = $v; }
+}
+
+# parametry jądra: wyznacza docelowy target i opcje (zenit.unit=, systemd.unit=, single, 1, S, 3, 5, emergency, rescue)
+func targetFromCmdline($cmdline, $fallback) {
+    $t = $fallback;
+    foreach (util.splitWords($cmdline) as $w) {
+        if (starts_with($w, "zenit.unit=")) { $t = substr($w, 11, strlen($w) - 11); }
+        elseif (starts_with($w, "systemd.unit=")) { $t = substr($w, 13, strlen($w) - 13); }
+        elseif ($w == "single" || $w == "s" || $w == "S" || $w == "1" || $w == "rescue") { $t = "rescue.target"; }
+        elseif ($w == "emergency") { $t = "emergency.target"; }
+        elseif ($w == "3") { $t = "multi-user.target"; }
+        elseif ($w == "5") { $t = "graphical.target"; }
+    }
+    if (util.unitType($t) == "") { $t = $t . ".target"; }
+    return $t;
+}

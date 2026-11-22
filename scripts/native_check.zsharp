@@ -1,0 +1,10 @@
+import Workspace.parser;
+import Workspace.link;
+import Workspace.ir;
+$file = System.args()[1];
+$ast = parser.parse(File.read($file));
+$r = link.link($ast, $file);
+foreach ($r["errors"] as $e) { echo "LINK " . strval($e[3]) . ":" . strval($e[0]) . " " . $e[1] . " " . $e[2]; }
+$lw = ir.lower($r["ast"]);
+foreach ($lw["errors"] as $e) { echo "IR line " . strval($e[0]) . " " . $e[1] . " " . $e[2]; }
+echo "funcs: " . strval(count($lw["funcs"])) . " ir-errors: " . strval(count($lw["errors"]));

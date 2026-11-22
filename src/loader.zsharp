@@ -1,0 +1,282 @@
+namespace loader;
+import Workspace.util;
+import Workspace.ini;
+import Workspace.unit;
+
+class Loader {
+    public $sys;
+    public $dirs = [];          # katalogi wyszukiwania, od najwyższego priorytetu
+    public $enableDir = "";     # gdzie enable/mask zapisują symlinki
+    public $ctx = [];
+    public $cache = [];
+
+    public func __construct($sys, $dirs, $enableDir, $ctx) {
+        $this->sys = $sys;
+        $this->dirs = $dirs;
+        $this->enableDir = $enableDir;
+        $this->ctx = $ctx;
+    }
+
+    public func clearCache() { $this->cache = []; }
+
+    # Wynik: ["path" => str, "masked" => bool, "alias" => nazwa_docelowa|""] albo null
+    public func locate($name) {
+        $cands = [$name];
+        if (util.isInstance($name)) { $cands[] = util.templateOf($name); }
+        foreach ($cands as $cand) {
+            foreach ($this->dirs as $d) {
+                $p = util.joinPath($d, $cand);
+                $k = $this->sys->stat($p);
+                if ($k == 0) { continue; }
+                if ($k == 3) {
+                    $t = $this->sys->readlink($p);
+                    if ($t == "/dev/null") { return ["path" => $p, "masked" => true, "alias" => ""]; }
+                    $base = util.basename($t);
+                    if ($base != $cand && $base != "") {
+                        # alias: symlink do pliku o innej nazwie
+                        $real = $this->locate($base);
+                        if ($real != null) { $real["alias"] = $base; return $real; }
+                    }
+                    if ($this->sys->stat($p) == 0) { continue; }
+                }
+                return ["path" => $p, "masked" => false, "alias" => ""];
+            }
+        }
+        return null;
+    }
+
+    func dropinFiles($name) {
+        $dirsToTry = [$name . ".d"];
+        if (util.isInstance($name)) { $dirsToTry[] = util.templateOf($name) . ".d"; }
+        $dirsToTry[] = util.unitType($name) . ".d";
+        $found = [];      # nazwa pliku => ścieżka (wyższy priorytet wygrywa)
+        $names = [];
+        foreach ($dirsToTry as $dd) {
+            foreach ($this->dirs as $d) {
+                $full = util.joinPath($d, $dd);
+                $list = $this->sys->dirList($full);
+                if ($list == null) { continue; }
+                foreach ($list as $f) {
+                    if (!ends_with($f, ".conf")) { continue; }
+                    if (($found[$f] ?? null) == null) {
+                        $found[$f] = util.joinPath($full, $f);
+                        $names[] = $f;
+                    }
+                }
+            }
+        }
+        $out = [];
+        foreach (sort($names) as $n) { $out[] = $found[$n]; }
+        return $out;
+    }
+
+    func wantsFromDirs($name, $suffix) {
+        $out = [];
+        $dirName = $name . $suffix;
+        if (util.isInstance($name)) { $dirName = $name . $suffix; }
+        foreach ($this->dirs as $d) {
+            $list = $this->sys->dirList(util.joinPath($d, $dirName));
+            if ($list == null) { continue; }
+            foreach ($list as $f) { $out = util.add_unique($out, $f); }
+        }
+        return $out;
+    }
+
+    # Ładuje jednostkę; nigdy nie rzuca — błędy w loadError
+    public func load($name) {
+        $hit = $this->cache[$name] ?? null;
+        if ($hit != null) { return $hit; }
+        $u = $this->loadFresh($name);
+        $this->cache[$name] = $u;
+        return $u;
+    }
+
+    func loadFresh($name) {
+        if (!util.validUnitName($name)) {
+            $u = new Unit($name);
+            $u->loadError = "niepoprawna nazwa jednostki";
+            return $u;
+        }
+        $loc = $this->locate($name);
+        if ($loc == null) {
+            $u = new Unit($name);
+            $u->loadError = "not-found";
+            return $u;
+        }
+        if ($loc["masked"]) {
+            $u = new Unit($name);
+            $u->masked = true;
+            $u->path = $loc["path"];
+            $u->loadError = "masked";
+            return $u;
+        }
+        $text = $this->sys->readFile($loc["path"], 1048576);
+        if ($text == null) {
+            $u = new Unit($name);
+            $u->loadError = "nie można odczytać " . $loc["path"];
+            return $u;
+        }
+        $main = ini.parse($text);
+        $sections = $main["sections"];
+        $drops = $this->dropinFiles($name);
+        foreach ($drops as $df) {
+            $dt = $this->sys->readFile($df, 262144);
+            if ($dt == null) { continue; }
+            $dp = ini.parse($dt);
+            foreach ($dp["sections"] as $s) { $sections[] = $s; }
+        }
+        $ctx = $this->ctx;
+        $u = unit.build($name, $sections, $loc["path"], $ctx);
+        $u->dropins = $drops;
+        foreach ($main["errors"] as $e) { $u->warnings[] = $e; }
+        if ($loc["alias"] != "") { $u->aliases = util.add_unique($u->aliases, $loc["alias"]); }
+        foreach ($this->wantsFromDirs($name, ".wants") as $w) { $u->wants = util.add_unique($u->wants, $w); }
+        foreach ($this->wantsFromDirs($name, ".requires") as $w) { $u->requires = util.add_unique($u->requires, $w); }
+        unit.applyDefaults($u);
+        return $u;
+    }
+
+    # nazwy wszystkich plików jednostek [nazwa => ścieżka]
+    public func listFiles() {
+        $seen = [];
+        $names = [];
+        foreach ($this->dirs as $d) {
+            $list = $this->sys->dirList($d);
+            if ($list == null) { continue; }
+            foreach ($list as $f) {
+                if (!util.validUnitName($f)) { continue; }
+                if (($seen[$f] ?? null) == null) {
+                    $seen[$f] = util.joinPath($d, $f);
+                    $names[] = $f;
+                }
+            }
+        }
+        $out = [];
+        foreach (sort($names) as $n) { $out[] = [$n, $seen[$n]]; }
+        return $out;
+    }
+
+    # enabled | disabled | static | masked | alias | not-found
+    public func enableState($name) {
+        $loc = $this->locate($name);
+        if ($loc == null) { return "not-found"; }
+        if ($loc["masked"]) { return "masked"; }
+        # symlink w katalogu włączeń wskazujący na nas?
+        foreach ($this->dirs as $d) {
+            $list = $this->sys->dirList($d);
+            if ($list == null) { continue; }
+            foreach ($list as $f) {
+                if (!ends_with($f, ".wants") && !ends_with($f, ".requires")) { continue; }
+                if ($this->sys->stat(util.joinPath(util.joinPath($d, $f), $name)) != 0) { return "enabled"; }
+            }
+        }
+        $u = $this->load($name);
+        if (count($u->wantedBy) == 0 && count($u->requiredBy) == 0 && count($u->aliases) == 0 && !$u->has("Install", "Also")) { return "static"; }
+        return "disabled";
+    }
+
+    # tworzy symlinki z [Install]; zwraca listę komunikatów albo ["ERR: ..."]
+    public func enable($name) {
+        $loc = $this->locate($name);
+        if ($loc == null) { return ["ERR: nie znaleziono jednostki " . $name]; }
+        if ($loc["masked"]) { return ["ERR: jednostka jest zamaskowana"]; }
+        $u = $this->load($name);
+        $msgs = [];
+        $target = $loc["path"];
+        $targets = [];
+        foreach ($u->wantedBy as $t) { $targets[] = [$t . ".wants", $t]; }
+        foreach ($u->requiredBy as $t) { $targets[] = [$t . ".requires", $t]; }
+        if (util.isTemplate($name)) {
+            $di = $u->get("Install", "DefaultInstance", "");
+            if ($di == "") { return ["ERR: " . $name . " to szablon; podaj instancję (np. " . util.instantiate($name, "x") . ")"]; }
+            $name = util.instantiate($name, $di);
+        }
+        foreach ($targets as $t) {
+            $dir = util.joinPath($this->enableDir, $t[0]);
+            $r = $this->sys->mkdirp($dir, 493);
+            if ($r < 0) { return ["ERR: mkdir " . $dir . ": " . $this->sys->errstr($r)]; }
+            $link = util.joinPath($dir, $name);
+            if ($this->sys->stat($link) != 0) { continue; }
+            $r = $this->sys->symlink($target, $link);
+            if ($r < 0) { return ["ERR: symlink " . $link . ": " . $this->sys->errstr($r)]; }
+            $msgs[] = "Created symlink " . $link . " -> " . $target;
+        }
+        foreach ($u->aliases as $a) {
+            $link = util.joinPath($this->enableDir, $a);
+            if ($this->sys->stat($link) == 0) {
+                $this->sys->symlink($target, $link);
+                $msgs[] = "Created symlink " . $link . " -> " . $target;
+            }
+        }
+        foreach ($u->getList("Install", "Also") as $also) {
+            foreach ($this->enable($also) as $m) { $msgs[] = $m; }
+        }
+        $this->clearCache();
+        return $msgs;
+    }
+
+    public func disable($name) {
+        $msgs = [];
+        $list = $this->sys->dirList($this->enableDir);
+        if ($list != null) {
+            foreach ($list as $f) {
+                if (!ends_with($f, ".wants") && !ends_with($f, ".requires")) { continue; }
+                $link = util.joinPath(util.joinPath($this->enableDir, $f), $name);
+                if ($this->sys->stat($link) == 3) {
+                    $this->sys->unlink($link);
+                    $msgs[] = "Removed " . $link;
+                }
+            }
+        }
+        $u = $this->load($name);
+        foreach ($u->aliases as $a) {
+            $link = util.joinPath($this->enableDir, $a);
+            if ($this->sys->stat($link) == 3) { $this->sys->unlink($link); $msgs[] = "Removed " . $link; }
+        }
+        $this->clearCache();
+        return $msgs;
+    }
+
+    public func mask($name) {
+        $this->sys->mkdirp($this->enableDir, 493);
+        $link = util.joinPath($this->enableDir, $name);
+        if ($this->sys->stat($link) != 0) { $this->sys->unlink($link); }
+        $r = $this->sys->symlink("/dev/null", $link);
+        $this->clearCache();
+        if ($r < 0) { return ["ERR: " . $this->sys->errstr($r)]; }
+        return ["Created symlink " . $link . " -> /dev/null"];
+    }
+
+    public func unmask($name) {
+        $link = util.joinPath($this->enableDir, $name);
+        if ($this->sys->stat($link) == 3 && $this->sys->readlink($link) == "/dev/null") {
+            $this->sys->unlink($link);
+            $this->clearCache();
+            return ["Removed " . $link];
+        }
+        return [];
+    }
+
+    public func defaultTarget() {
+        foreach ($this->dirs as $d) {
+            $p = util.joinPath($d, "default.target");
+            if ($this->sys->stat($p) == 3) {
+                $t = $this->sys->readlink($p);
+                if ($t != null) { return util.basename($t); }
+            }
+        }
+        return "multi-user.target";
+    }
+
+    public func setDefault($target) {
+        $loc = $this->locate($target);
+        if ($loc == null) { return "ERR: nie znaleziono " . $target; }
+        $this->sys->mkdirp($this->enableDir, 493);
+        $link = util.joinPath($this->enableDir, "default.target");
+        if ($this->sys->stat($link) != 0) { $this->sys->unlink($link); }
+        $r = $this->sys->symlink($loc["path"], $link);
+        if ($r < 0) { return "ERR: " . $this->sys->errstr($r); }
+        $this->clearCache();
+        return "Created symlink " . $link . " -> " . $loc["path"];
+    }
+}

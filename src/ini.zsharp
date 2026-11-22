@@ -1,0 +1,44 @@
+namespace ini;
+
+# zwraca ["sections" => [...], "errors" => ["linia N: ..."]]
+func parse($text) {
+    $sections = [];
+    $errors = [];
+    $cur = null;
+    $raw = split($text, "\n");
+    $total = count($raw);
+    $i = 0;
+    while ($i < $total) {
+        $lineNo = $i + 1;
+        $line = $raw[$i];
+        $i += 1;
+        if (ends_with($line, "\r")) { $line = substr($line, 0, strlen($line) - 1); }
+        $t = trim($line);
+        if ($t == "") { continue; }
+        $c0 = substr($t, 0, 1);
+        if ($c0 == "#" || $c0 == ";") { continue; }
+        # kontynuacja: linia kończąca się \ łączy się z następną (spacja zamiast \ + nowa linia)
+        while (ends_with($t, "\\") && $i < $total) {
+            $next = trim($raw[$i]);
+            $i += 1;
+            if (starts_with($next, "#") || starts_with($next, ";")) { continue; }
+            $t = substr($t, 0, strlen($t) - 1) . " " . $next;
+        }
+        if ($c0 == "[") {
+            if (!ends_with($t, "]")) { $errors[] = "linia " . strval($lineNo) . ": niedomknięta sekcja"; continue; }
+            if ($cur != null) { $sections[] = $cur; }
+            $cur = ["name" => substr($t, 1, strlen($t) - 2), "items" => []];
+            continue;
+        }
+        $eq = index_of($t, "=");
+        if ($eq <= 0) { $errors[] = "linia " . strval($lineNo) . ": oczekiwano Klucz=Wartość"; continue; }
+        if ($cur == null) { $errors[] = "linia " . strval($lineNo) . ": przypisanie poza sekcją"; continue; }
+        $key = trim(substr($t, 0, $eq));
+        $val = trim(substr($t, $eq + 1, strlen($t) - $eq - 1));
+        $items = $cur["items"];
+        $items[] = [$key, $val, $lineNo];
+        $cur["items"] = $items;
+    }
+    if ($cur != null) { $sections[] = $cur; }
+    return ["sections" => $sections, "errors" => $errors];
+}

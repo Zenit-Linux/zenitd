@@ -1,0 +1,6 @@
+[Unit]
+Description=Zatrzymaj system
+DefaultDependencies=no
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/zenitctl halt

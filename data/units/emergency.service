@@ -1,0 +1,10 @@
+[Unit]
+Description=Powłoka awaryjna
+DefaultDependencies=no
+[Service]
+Type=idle
+ExecStart=-/bin/sh -c 'exec /sbin/sulogin || exec /bin/sh'
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/console
+Restart=no

@@ -1,0 +1,8 @@
+[Unit]
+Description=Przemontuj / do odczytu i zapisu
+DefaultDependencies=no
+ConditionVirtualization=!container
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount -o remount,rw /

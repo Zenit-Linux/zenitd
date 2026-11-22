@@ -1,0 +1,6 @@
+[Unit]
+Description=System wieloużytkownikowy
+Requires=basic.target
+After=basic.target
+Conflicts=rescue.service rescue.target
+AllowIsolate=yes

@@ -1,0 +1,14 @@
+[Unit]
+Description=Konsola szeregowa na %I
+After=basic.target
+ConditionPathExists=/dev/%I
+[Service]
+ExecStart=-/sbin/agetty -L 115200 %I vt102
+Type=idle
+Restart=always
+RestartSec=0
+TTYPath=/dev/%I
+StandardInput=tty
+StandardOutput=tty
+[Install]
+WantedBy=getty.target

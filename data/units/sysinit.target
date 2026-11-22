@@ -1,0 +1,6 @@
+[Unit]
+Description=Inicjalizacja systemu
+DefaultDependencies=no
+Conflicts=emergency.service emergency.target
+Wants=zenit-remount-root.service local-fs.target
+After=zenit-remount-root.service local-fs.target

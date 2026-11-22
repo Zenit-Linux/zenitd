@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart
+DefaultDependencies=no
+Requires=zenit-reboot.service
+After=zenit-reboot.service
+AllowIsolate=yes

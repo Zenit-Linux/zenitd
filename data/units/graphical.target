@@ -1,0 +1,6 @@
+[Unit]
+Description=Tryb graficzny
+Requires=multi-user.target
+After=multi-user.target
+Conflicts=rescue.service rescue.target
+AllowIsolate=yes

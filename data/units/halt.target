@@ -1,0 +1,6 @@
+[Unit]
+Description=Zatrzymanie
+DefaultDependencies=no
+Requires=zenit-halt.service
+After=zenit-halt.service
+AllowIsolate=yes

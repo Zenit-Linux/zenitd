@@ -1,0 +1,6 @@
+[Unit]
+Description=Wyłącz system
+DefaultDependencies=no
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/zenitctl poweroff

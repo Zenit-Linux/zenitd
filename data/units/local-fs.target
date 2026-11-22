@@ -1,0 +1,5 @@
+[Unit]
+Description=Lokalne systemy plików
+DefaultDependencies=no
+Wants=zenit-mount-local.service
+After=zenit-mount-local.service

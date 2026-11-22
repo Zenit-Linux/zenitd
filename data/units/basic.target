@@ -1,0 +1,6 @@
+[Unit]
+Description=Podstawowy system
+Requires=sysinit.target
+Wants=sockets.target timers.target udevd.service
+After=sysinit.target sockets.target timers.target udevd.service
+DefaultDependencies=no

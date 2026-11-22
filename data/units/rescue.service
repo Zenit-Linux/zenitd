@@ -1,0 +1,11 @@
+[Unit]
+Description=Powłoka ratunkowa
+DefaultDependencies=no
+After=sysinit.target
+[Service]
+Type=idle
+ExecStart=-/bin/sh -c 'exec /sbin/sulogin || exec /bin/sh'
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/console
+Restart=no

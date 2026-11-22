@@ -1,0 +1,6 @@
+[Unit]
+Description=Wyłączenie
+DefaultDependencies=no
+Requires=zenit-poweroff.service
+After=zenit-poweroff.service
+AllowIsolate=yes

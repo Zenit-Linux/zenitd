@@ -1,0 +1,6 @@
+[Unit]
+Description=Uruchom system ponownie
+DefaultDependencies=no
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/zenitctl reboot

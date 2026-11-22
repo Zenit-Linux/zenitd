@@ -1,0 +1,11 @@
+[Unit]
+Description=Zamontuj lokalne systemy plików z /etc/fstab
+DefaultDependencies=no
+After=zenit-remount-root.service
+ConditionVirtualization=!container
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount -a -t nonfs,nfs4,nfs4,cifs,smbfs,ncpfs,sshfs,fuse.sshfs -O no_netdev
+ExecStart=-/sbin/swapon -a
+ExecStop=-/sbin/swapoff -a

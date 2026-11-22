@@ -1,0 +1,11 @@
+[Unit]
+Description=Menedżer urządzeń (udev)
+DefaultDependencies=no
+After=sysinit.target
+ConditionVirtualization=!container
+[Service]
+Type=simple
+ExecStart=-/sbin/udevd
+ExecStartPost=-/sbin/udevadm trigger --action=add
+ExecStartPost=-/sbin/udevadm settle --timeout=30
+Restart=on-failure

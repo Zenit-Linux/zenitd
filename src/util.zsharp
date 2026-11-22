@@ -1,0 +1,426 @@
+namespace util;
+
+func isSpaceCh($c) { return $c == " " || $c == "\t" || $c == "\n" || $c == "\r"; }
+
+# nowa tablica bez wartości $val
+func without($arr, $val) {
+    $out = [];
+    foreach ($arr as $v) { if ($v != $val) { $out[] = $v; } }
+    return $out;
+}
+
+func contains_item($arr, $val) {
+    foreach ($arr as $v) { if ($v == $val) { return true; } }
+    return false;
+}
+
+# dopisuje do listy bez duplikatów
+func add_unique($arr, $val) {
+    if (contains_item($arr, $val)) { return $arr; }
+    $arr[] = $val;
+    return $arr;
+}
+
+func concat($a, $b) {
+    foreach ($b as $v) { $a[] = $v; }
+    return $a;
+}
+
+func lines($text) {
+    $out = [];
+    foreach (split($text, "\n") as $l) { $out[] = $l; }
+    return $out;
+}
+
+func basename($p) {
+    $i = strlen($p) - 1;
+    while ($i >= 0 && substr($p, $i, 1) == "/") { $i -= 1; }
+    if ($i < 0) { return "/"; }
+    $end = $i;
+    while ($i >= 0 && substr($p, $i, 1) != "/") { $i -= 1; }
+    return substr($p, $i + 1, $end - $i);
+}
+
+func dirname($p) {
+    $i = strlen($p) - 1;
+    while ($i > 0 && substr($p, $i, 1) == "/") { $i -= 1; }
+    while ($i >= 0 && substr($p, $i, 1) != "/") { $i -= 1; }
+    if ($i < 0) { return "."; }
+    if ($i == 0) { return "/"; }
+    return substr($p, 0, $i);
+}
+
+func joinPath($a, $b) {
+    if (starts_with($b, "/")) { return $b; }
+    if (ends_with($a, "/")) { return $a . $b; }
+    return $a . "/" . $b;
+}
+
+# ───────────── parsowanie wartości dyrektyw ─────────────
+
+func parseBool($s, $def) {
+    $v = lower(trim($s));
+    if ($v == "1" || $v == "yes" || $v == "true" || $v == "on" || $v == "y") { return true; }
+    if ($v == "0" || $v == "no" || $v == "false" || $v == "off" || $v == "n") { return false; }
+    return $def;
+}
+
+# czas -> milisekundy; "infinity" => -1; null gdy niepoprawny. Bez jednostki = sekundy.
+func parseTimeMs($s) {
+    $s = trim($s);
+    if ($s == "") { return null; }
+    if ($s == "infinity" || $s == "inf") { return -1; }
+    $total = 0.0;
+    $i = 0;
+    $n = strlen($s);
+    $any = false;
+    while ($i < $n) {
+        while ($i < $n && isSpaceCh(substr($s, $i, 1))) { $i += 1; }
+        if ($i >= $n) { break; }
+        $st = $i;
+        while ($i < $n && (is_digit(substr($s, $i, 1)) || substr($s, $i, 1) == ".")) { $i += 1; }
+        if ($i == $st) { return null; }
+        $num = floatval(substr($s, $st, $i - $st));
+        $us = $i;
+        while ($i < $n && is_alpha(substr($s, $i, 1))) { $i += 1; }
+        $unit = substr($s, $us, $i - $us);
+        $mul = null;
+        if ($unit == "" || $unit == "s" || $unit == "sec" || $unit == "second" || $unit == "seconds") { $mul = 1000.0; }
+        elseif ($unit == "ms" || $unit == "msec") { $mul = 1.0; }
+        elseif ($unit == "us" || $unit == "usec") { $mul = 0.001; }
+        elseif ($unit == "m" || $unit == "min" || $unit == "minute" || $unit == "minutes") { $mul = 60000.0; }
+        elseif ($unit == "h" || $unit == "hr" || $unit == "hour" || $unit == "hours") { $mul = 3600000.0; }
+        elseif ($unit == "d" || $unit == "day" || $unit == "days") { $mul = 86400000.0; }
+        elseif ($unit == "w" || $unit == "week" || $unit == "weeks") { $mul = 604800000.0; }
+        if ($mul == null) { return null; }
+        $total += $num * $mul;
+        $any = true;
+    }
+    if (!$any) { return null; }
+    return intval($total + 0.5);
+}
+
+# rozmiar -> bajty; "infinity" => -1; null gdy niepoprawny lub procentowy (obsługuje wołający)
+func parseSize($s) {
+    $s = trim($s);
+    if ($s == "infinity" || $s == "inf") { return -1; }
+    if ($s == "" || ends_with($s, "%")) { return null; }
+    $i = 0;
+    $n = strlen($s);
+    while ($i < $n && is_digit(substr($s, $i, 1))) { $i += 1; }
+    if ($i == 0) { return null; }
+    $num = intval(substr($s, 0, $i));
+    $u = upper(trim(substr($s, $i, $n - $i)));
+    if ($u == "" || $u == "B") { return $num; }
+    if ($u == "K" || $u == "KB" || $u == "KIB") { return $num * 1024; }
+    if ($u == "M" || $u == "MB" || $u == "MIB") { return $num * 1048576; }
+    if ($u == "G" || $u == "GB" || $u == "GIB") { return $num * 1073741824; }
+    if ($u == "T" || $u == "TB" || $u == "TIB") { return $num * 1099511627776; }
+    return null;
+}
+
+func parseInt($s, $def) {
+    $s = trim($s);
+    if ($s == "") { return $def; }
+    $i = 0;
+    if (substr($s, 0, 1) == "-") { $i = 1; }
+    if ($i >= strlen($s)) { return $def; }
+    while ($i < strlen($s)) {
+        if (!is_digit(substr($s, $i, 1))) { return $def; }
+        $i += 1;
+    }
+    return intval($s);
+}
+
+# ───────────── tokenizacja ─────────────
+
+# słowa rozdzielone białymi znakami z obsługą cudzysłowów ' i " oraz \-escape (jak linie ExecStart)
+func splitWords($s) {
+    $out = [];
+    $cur = "";
+    $has = false;
+    $q = "";
+    $i = 0;
+    $n = strlen($s);
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($q != "") {
+            if ($c == $q) { $q = ""; }
+            elseif ($c == "\\" && $q == "\"" && $i + 1 < $n) {
+                $i += 1;
+                $d = substr($s, $i, 1);
+                if ($d == "n") { $cur = $cur . "\n"; }
+                elseif ($d == "t") { $cur = $cur . "\t"; }
+                else { $cur = $cur . $d; }
+            } else { $cur = $cur . $c; }
+        } elseif ($c == "\"" || $c == "'") { $q = $c; $has = true; }
+        elseif ($c == "\\" && $i + 1 < $n) { $i += 1; $cur = $cur . substr($s, $i, 1); $has = true; }
+        elseif (isSpaceCh($c)) {
+            if ($has || $cur != "") { $out[] = $cur; $cur = ""; $has = false; }
+        } else { $cur = $cur . $c; $has = true; }
+        $i += 1;
+    }
+    if ($has || $cur != "") { $out[] = $cur; }
+    return $out;
+}
+
+# lista nazw rozdzielonych białymi znakami (After=, Wants=, ...)
+func splitList($s) {
+    $out = [];
+    foreach (splitWords($s) as $w) { $out[] = $w; }
+    return $out;
+}
+
+# $VAR i ${VAR} z mapy środowiska; $$ => $
+func expandVars($s, $env) {
+    if (!contains($s, "$")) { return $s; }
+    $out = "";
+    $i = 0;
+    $n = strlen($s);
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c != "$" || $i + 1 >= $n) { $out = $out . $c; $i += 1; continue; }
+        $d = substr($s, $i + 1, 1);
+        if ($d == "$") { $out = $out . "$"; $i += 2; continue; }
+        $name = "";
+        if ($d == "{") {
+            $j = $i + 2;
+            while ($j < $n && substr($s, $j, 1) != "}") { $name = $name . substr($s, $j, 1); $j += 1; }
+            $i = $j + 1;
+        } else {
+            $j = $i + 1;
+            while ($j < $n && is_alnum(substr($s, $j, 1))) { $name = $name . substr($s, $j, 1); $j += 1; }
+            $i = $j;
+        }
+        $out = $out . ($env[$name] ?? "");
+    }
+    return $out;
+}
+
+# Exec*= : modyfikatory (-, @, +, !, :), argv. ["ignore"=>bool, "argv"=>[...], "path"=>str]
+func parseExec($line, $env) {
+    $line = trim($line);
+    $ignore = false;
+    $at = false;
+    while ($line != "") {
+        $c = substr($line, 0, 1);
+        if ($c == "-") { $ignore = true; }
+        elseif ($c == "@") { $at = true; }
+        elseif ($c == "+" || $c == "!" || $c == ":") { }
+        else { break; }
+        $line = substr($line, 1, strlen($line) - 1);
+    }
+    $words = splitWords($line);
+    if (count($words) == 0) { return null; }
+    $argv = [];
+    foreach ($words as $w) { $argv[] = expandVars($w, $env); }
+    $path = $argv[0];
+    if ($at && count($argv) > 1) { $argv = drop_first($argv); }
+    return ["ignore" => $ignore, "argv" => $argv, "path" => $path];
+}
+
+func drop_first($arr) {
+    $out = [];
+    $i = 0;
+    foreach ($arr as $v) { if ($i > 0) { $out[] = $v; } $i += 1; }
+    return $out;
+}
+
+# ───────────── nazwy jednostek ─────────────
+
+func unitType($name) {
+    $i = strlen($name) - 1;
+    while ($i >= 0 && substr($name, $i, 1) != ".") { $i -= 1; }
+    if ($i < 0) { return ""; }
+    return substr($name, $i + 1, strlen($name) - $i - 1);
+}
+
+# nazwa bez sufiksu typu
+func unitStem($name) {
+    $i = strlen($name) - 1;
+    while ($i >= 0 && substr($name, $i, 1) != ".") { $i -= 1; }
+    if ($i < 0) { return $name; }
+    return substr($name, 0, $i);
+}
+
+func isTemplate($name) {
+    $st = unitStem($name);
+    return ends_with($st, "@");
+}
+
+func isInstance($name) {
+    $st = unitStem($name);
+    $at = index_of($st, "@");
+    return $at > 0 && $at < strlen($st) - 1;
+}
+
+# foo@bar.service => foo@.service
+func templateOf($name) {
+    $st = unitStem($name);
+    $at = index_of($st, "@");
+    if ($at < 0) { return $name; }
+    return substr($st, 0, $at + 1) . "." . unitType($name);
+}
+
+func instanceOf($name) {
+    $st = unitStem($name);
+    $at = index_of($st, "@");
+    if ($at < 0) { return ""; }
+    return substr($st, $at + 1, strlen($st) - $at - 1);
+}
+
+func prefixOf($name) {
+    $st = unitStem($name);
+    $at = index_of($st, "@");
+    if ($at < 0) { return $st; }
+    return substr($st, 0, $at);
+}
+
+func instantiate($template, $inst) {
+    $st = unitStem($template);
+    return $st . $inst . "." . unitType($template);
+}
+
+func validUnitName($name) {
+    if ($name == "" || strlen($name) > 255) { return false; }
+    $t = unitType($name);
+    if (!contains_item(["service", "socket", "target", "timer", "mount", "path", "slice", "swap", "device", "scope"], $t)) { return false; }
+    $i = 0;
+    $stem = unitStem($name);
+    if ($stem == "" || $stem == "@") { return false; }
+    while ($i < strlen($stem)) {
+        $c = substr($stem, $i, 1);
+        if (!(is_alnum($c) || $c == "-" || $c == "_" || $c == "@" || $c == ":" || $c == "\\" || $c == ".")) { return false; }
+        $i += 1;
+    }
+    return true;
+}
+
+# dopisuje .service gdy brak sufiksu typu
+func normalizeName($name) {
+    $t = unitType($name);
+    if (contains_item(["service", "socket", "target", "timer", "mount", "path", "slice", "swap", "device", "scope"], $t)) { return $name; }
+    return $name . ".service";
+}
+
+# systemd-escape (uproszczone, dla instancji ścieżek): "/" <-> "-"
+func unescapeInstance($s) {
+    $out = "";
+    $i = 0;
+    $n = strlen($s);
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c == "\\" && $i + 3 < $n && substr($s, $i + 1, 1) == "x") {
+            $out = $out . chr(intval(hexval(substr($s, $i + 2, 2))));
+            $i += 4;
+        } elseif ($c == "-") { $out = $out . "/"; $i += 1; }
+        else { $out = $out . $c; $i += 1; }
+    }
+    return $out;
+}
+
+func hexval($h) {
+    $v = 0;
+    foreach (chars(lower($h)) as $c) {
+        $d = index_of("0123456789abcdef", $c);
+        if ($d < 0) { return 0; }
+        $v = $v * 16 + $d;
+    }
+    return $v;
+}
+
+# specyfikatory %n %N %p %P %i %I %t %S %C %L %E %u %U %h %H %%; ctx: name, user, uid, home, host, runtime
+func specifiers($s, $ctx) {
+    if (!contains($s, "%")) { return $s; }
+    $name = $ctx["name"] ?? "";
+    $inst = instanceOf($name);
+    $out = "";
+    $i = 0;
+    $n = strlen($s);
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c != "%" || $i + 1 >= $n) { $out = $out . $c; $i += 1; continue; }
+        $d = substr($s, $i + 1, 1);
+        $i += 2;
+        if ($d == "%") { $out = $out . "%"; }
+        elseif ($d == "n") { $out = $out . $name; }
+        elseif ($d == "N") { $out = $out . unitStem($name); }
+        elseif ($d == "p" || $d == "P") { $out = $out . prefixOf($name); }
+        elseif ($d == "i") { $out = $out . $inst; }
+        elseif ($d == "I") { $out = $out . unescapeInstance($inst); }
+        elseif ($d == "t") { $out = $out . ($ctx["runtime"] ?? "/run"); }
+        elseif ($d == "S") { $out = $out . ($ctx["state"] ?? "/var/lib"); }
+        elseif ($d == "C") { $out = $out . ($ctx["cache"] ?? "/var/cache"); }
+        elseif ($d == "L") { $out = $out . ($ctx["logs"] ?? "/var/log"); }
+        elseif ($d == "E") { $out = $out . ($ctx["conf"] ?? "/etc"); }
+        elseif ($d == "u") { $out = $out . ($ctx["user"] ?? "root"); }
+        elseif ($d == "U") { $out = $out . strval($ctx["uid"] ?? 0); }
+        elseif ($d == "h") { $out = $out . ($ctx["home"] ?? "/root"); }
+        elseif ($d == "H") { $out = $out . ($ctx["host"] ?? "localhost"); }
+        else { $out = $out . "%" . $d; }
+    }
+    return $out;
+}
+
+# ───────────── formatowanie ─────────────
+
+func fmtDuration($ms) {
+    if ($ms < 0) { return "infinity"; }
+    if ($ms < 1000) { return strval($ms) . "ms"; }
+    $s = intval($ms / 1000);
+    if ($s < 60) {
+        $frac = $ms % 1000;
+        if ($frac == 0) { return strval($s) . "s"; }
+        return strval($s) . "." . pad_left(strval($frac), 3, "0") . "s";
+    }
+    $m = intval($s / 60);
+    if ($m < 60) { return strval($m) . "min " . strval($s % 60) . "s"; }
+    $h = intval($m / 60);
+    if ($h < 24) { return strval($h) . "h " . strval($m % 60) . "min"; }
+    return strval(intval($h / 24)) . "d " . strval($h % 24) . "h";
+}
+
+func fmtBytes($b) {
+    if ($b < 1024) { return strval($b) . "B"; }
+    if ($b < 1048576) { return strval(intval($b / 1024)) . "K"; }
+    if ($b < 1073741824) { return strval(intval($b / 1048576)) . "M"; }
+    return strval(intval($b / 1073741824)) . "G";
+}
+
+func twoDigits($n) { return pad_left(strval($n), 2, "0"); }
+
+# ucieczki pól dziennika: \\ \t \n
+func escapeField($s) {
+    if (!contains($s, "\\") && !contains($s, "\t") && !contains($s, "\n")) { return $s; }
+    $s = replace($s, "\\", "\\\\");
+    $s = replace($s, "\t", "\\t");
+    return replace($s, "\n", "\\n");
+}
+
+func unescapeField($s) {
+    if (!contains($s, "\\")) { return $s; }
+    $out = "";
+    $i = 0;
+    $n = strlen($s);
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c == "\\" && $i + 1 < $n) {
+            $d = substr($s, $i + 1, 1);
+            if ($d == "t") { $out = $out . "\t"; }
+            elseif ($d == "n") { $out = $out . "\n"; }
+            else { $out = $out . $d; }
+            $i += 2;
+        } else { $out = $out . $c; $i += 1; }
+    }
+    return $out;
+}
+
+# nazwa/numer sygnału ("TERM", "SIGKILL", "9") => numer
+func sigNum($s) {
+    $s = upper(trim($s));
+    if (starts_with($s, "SIG")) { $s = substr($s, 3, strlen($s) - 3); }
+    $names = ["HUP" => 1, "INT" => 2, "QUIT" => 3, "ABRT" => 6, "KILL" => 9, "USR1" => 10, "USR2" => 12, "PIPE" => 13, "ALRM" => 14, "TERM" => 15, "CONT" => 18, "STOP" => 19, "WINCH" => 28, "RTMIN+3" => 37, "RTMIN+4" => 38];
+    $v = $names[$s] ?? null;
+    if ($v != null) { return $v; }
+    return parseInt($s, 15);
+}

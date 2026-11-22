@@ -1,0 +1,44 @@
+import Workspace.util;
+import Workspace.ini;
+
+func eq($name, $got, $want) {
+    if ($got == $want) { echo "ok   " . $name; return 0; }
+    echo "FAIL " . $name . " got=" . strval($got) . " want=" . strval($want);
+    return 1;
+}
+$f = 0;
+$f += eq("time 5s", util.parseTimeMs("5s"), 5000);
+$f += eq("time 1min 30s", util.parseTimeMs("1min 30s"), 90000);
+$f += eq("time plain", util.parseTimeMs("90"), 90000);
+$f += eq("time ms", util.parseTimeMs("250ms"), 250);
+$f += eq("time inf", util.parseTimeMs("infinity"), -1);
+$f += eq("time bad", util.parseTimeMs("abc"), null);
+$f += eq("size", util.parseSize("512M"), 536870912);
+$f += eq("size inf", util.parseSize("infinity"), -1);
+$f += eq("bool", util.parseBool("Yes", false), true);
+$f += eq("words", join(util.splitWords("/bin/sh -c 'echo a b' \"x y\""), "|"), "/bin/sh|-c|echo a b|x y");
+$f += eq("words empty q", count(util.splitWords("a \"\" b")), 3);
+$f += eq("expand", util.expandVars("a-$X-${Y}-$$", ["X" => "1", "Y" => "2"]), "a-1-2-$");
+$e = util.parseExec("-/usr/bin/foo --bar=$A \"q r\"", ["A" => "z"]);
+$f += eq("exec ignore", $e["ignore"], true);
+$f += eq("exec argv", join($e["argv"], "|"), "/usr/bin/foo|--bar=z|q r");
+$f += eq("type", util.unitType("a@b.service"), "service");
+$f += eq("template", util.templateOf("getty@tty1.service"), "getty@.service");
+$f += eq("instance", util.instanceOf("getty@tty1.service"), "tty1");
+$f += eq("instantiate", util.instantiate("getty@.service", "tty2"), "getty@tty2.service");
+$f += eq("isTemplate", util.isTemplate("getty@.service"), true);
+$f += eq("isInstance", util.isInstance("getty@.service"), false);
+$f += eq("spec", util.specifiers("/dev/%i %n %N %%", ["name" => "getty@tty1.service"]), "/dev/tty1 getty@tty1.service getty@tty1 %");
+$f += eq("basename", util.basename("/usr/lib/x.service"), "x.service");
+$f += eq("dirname", util.dirname("/usr/lib/x.service"), "/usr/lib");
+$f += eq("dur", util.fmtDuration(90000), "1min 30s");
+$f += eq("esc", util.unescapeField(util.escapeField("a\tb\nc\\d")), "a\tb\nc\\d");
+$f += eq("valid", util.validUnitName("nginx.service"), true);
+$f += eq("invalid", util.validUnitName("a b.service"), false);
+
+$r = ini.parse("# c\n[Unit]\nDescription=Test \\\n more\nAfter=a.service\nAfter=b.service\n\n[Service]\nExecStart=/bin/true\nbad line\n");
+$f += eq("ini sections", count($r["sections"]), 2);
+$f += eq("ini cont", $r["sections"][0]["items"][0][1], "Test  more");
+$f += eq("ini keys", count($r["sections"][0]["items"]), 3);
+$f += eq("ini err", count($r["errors"]), 1);
+exit($f);

@@ -1,0 +1,613 @@
+namespace ctl;
+import Workspace.util;
+import Workspace.proto;
+import Workspace.loader;
+import Workspace.journal;
+import Workspace.config;
+
+class Opts {
+    public $cmd = "";
+    public $pos = [];
+    public $all = false;
+    public $noBlock = false;
+    public $now = false;
+    public $noReload = false;
+    public $quiet = false;
+    public $noLegend = false;
+    public $full = false;
+    public $failed = false;
+    public $reverse = false;
+    public $value = false;
+    public $user = false;
+    public $types = "";
+    public $states = "";
+    public $props = [];
+    public $lines = 10;
+    public $signal = "";
+    public $killWhom = "";
+    public $force = false;
+    public $help = false;
+    public $version = false;
+    public $unknown = [];
+}
+
+# Parsowanie argumentów w stylu systemctl
+func parseArgs($args) {
+    $o = new Opts();
+    $i = 0;
+    $n = count($args);
+    $endOpts = false;
+    while ($i < $n) {
+        $a = $args[$i];
+        $i += 1;
+        if ($endOpts || !starts_with($a, "-") || $a == "-") {
+            if ($o->cmd == "") { $o->cmd = $a; } else { $o->pos[] = $a; }
+            continue;
+        }
+        if ($a == "--") { $endOpts = true; continue; }
+        if ($a == "--user") { $o->user = true; }
+        elseif ($a == "--system") { $o->user = false; }
+        elseif ($a == "--no-block") { $o->noBlock = true; }
+        elseif ($a == "--now") { $o->now = true; }
+        elseif ($a == "--no-reload") { $o->noReload = true; }
+        elseif ($a == "-a" || $a == "--all") { $o->all = true; }
+        elseif ($a == "-q" || $a == "--quiet") { $o->quiet = true; }
+        elseif ($a == "--no-legend") { $o->noLegend = true; }
+        elseif ($a == "-l" || $a == "--full") { $o->full = true; }
+        elseif ($a == "--failed") { $o->failed = true; }
+        elseif ($a == "--reverse") { $o->reverse = true; }
+        elseif ($a == "--value") { $o->value = true; }
+        elseif ($a == "-f" || $a == "--force") { $o->force = true; }
+        elseif ($a == "-h" || $a == "--help") { $o->help = true; }
+        elseif ($a == "--version") { $o->version = true; }
+        elseif ($a == "--no-pager" || $a == "--no-ask-password" || $a == "--plain" || $a == "--no-wall" || $a == "--runtime" || $a == "--no-warn" || $a == "--wait") { }
+        elseif ($a == "-t") { if ($i < $n) { $o->types = $args[$i]; $i += 1; } }
+        elseif (starts_with($a, "--type=")) { $o->types = substr($a, 7, strlen($a) - 7); }
+        elseif (starts_with($a, "--state=")) { $o->states = substr($a, 8, strlen($a) - 8); }
+        elseif ($a == "-p") { if ($i < $n) { $o->props = util.concat($o->props, split($args[$i], ",")); $i += 1; } }
+        elseif (starts_with($a, "--property=")) { $o->props = util.concat($o->props, split(substr($a, 11, strlen($a) - 11), ",")); }
+        elseif ($a == "-n") { if ($i < $n) { $o->lines = util.parseInt($args[$i], 10); $i += 1; } }
+        elseif (starts_with($a, "--lines=")) { $o->lines = util.parseInt(substr($a, 8, strlen($a) - 8), 10); }
+        elseif ($a == "-s") { if ($i < $n) { $o->signal = $args[$i]; $i += 1; } }
+        elseif (starts_with($a, "--signal=")) { $o->signal = substr($a, 9, strlen($a) - 9); }
+        elseif (starts_with($a, "--kill-whom=") || starts_with($a, "--kill-who=")) { $o->killWhom = substr($a, index_of($a, "=") + 1, strlen($a)); }
+        elseif (starts_with($a, "--root=") || starts_with($a, "-H") || starts_with($a, "--host=") || starts_with($a, "--output=") || $a == "-o") {
+            if ($a == "-o" && $i < $n) { $i += 1; }
+        }
+        else { $o->unknown[] = $a; }
+    }
+    return $o;
+}
+
+class Ctl {
+    public $sys;
+    public $cfg;
+    public $loader;
+    public $color = false;
+    public $host = "localhost";
+
+    public func __construct($sys, $cfg) {
+        $this->sys = $sys;
+        $this->cfg = $cfg;
+        $this->color = $sys->isatty(1) && (System.env("TERM") ?? "dumb") != "dumb" && System.env("NO_COLOR") == null;
+        $this->host = $sys->hostname() ?? "localhost";
+        $ctx = ["user" => "root", "uid" => $cfg->uid, "home" => $cfg->home, "host" => $this->host, "runtime" => $cfg->runDirBase(),
+                "state" => $cfg->stateBase(), "cache" => $cfg->cacheBase(), "logs" => $cfg->logsBase(), "conf" => $cfg->confBase()];
+        $this->loader = new Loader($sys, $cfg->unitDirs, $cfg->enableDir, $ctx);
+    }
+
+    func out($s) { necho($s); }
+    # eecho dopisuje własny koniec linii — zdejmujemy końcowy \n z komunikatu
+    func err($s) {
+        if (ends_with($s, "\n")) { $s = substr($s, 0, strlen($s) - 1); }
+        eecho($s);
+    }
+
+    func paint($code, $s) {
+        if (!$this->color) { return $s; }
+        return "\x1b[" . $code . "m" . $s . "\x1b[0m";
+    }
+
+    # [kod, treść] albo null gdy zenitd nie działa
+    public func call($args) {
+        $fd = $this->sys->connectUnix($this->cfg->controlSock);
+        if ($fd < 0) { return null; }
+        $r = $this->sys->writeAll($fd, proto.encodeRequest($args), 5000);
+        if ($r < 0) { $this->sys->close($fd); return null; }
+        $resp = proto.readResponse($this->sys, $fd, 600000);
+        $this->sys->close($fd);
+        if ($resp == null) { return [1, "Brak odpowiedzi od zenitd\n"]; }
+        return [$resp["code"], $resp["body"]];
+    }
+
+    func notRunning() {
+        $this->err("zenitd nie działa (brak " . $this->cfg->controlSock . "). Uruchom system przez zenitd jako PID 1.\n");
+        return 1;
+    }
+
+    func unitArg($n) { return util.normalizeName($n); }
+
+    public func run($args) {
+        $o = parseArgs($args);
+        if ($o->version) { $this->out("zenitctl 0.1.0 (zenitd, Z#)\n"); return 0; }
+        if ($o->help || $o->cmd == "") { $this->out($this->usage()); return $o->cmd == "" && !$o->help ? 1 : 0; }
+        if (count($o->unknown) > 0) { $this->err("Nieznana opcja: " . $o->unknown[0] . "\n"); return 1; }
+        $c = $o->cmd;
+        if ($c == "start" || $c == "stop" || $c == "restart" || $c == "reload" || $c == "try-restart" || $c == "reload-or-restart" || $c == "condrestart" || $c == "try-reload-or-restart") { return $this->cmdJobs($o); }
+        if ($c == "enable") { return $this->cmdEnable($o, true); }
+        if ($c == "disable") { return $this->cmdEnable($o, false); }
+        if ($c == "mask") { return $this->cmdMask($o, true); }
+        if ($c == "unmask") { return $this->cmdMask($o, false); }
+        if ($c == "is-enabled") { return $this->cmdIsEnabled($o); }
+        if ($c == "cat") { return $this->cmdCat($o); }
+        if ($c == "list-unit-files") { return $this->cmdListFiles($o); }
+        if ($c == "get-default") { $this->out($this->loader->defaultTarget() . "\n"); return 0; }
+        if ($c == "set-default") { return $this->cmdSetDefault($o); }
+        if ($c == "list-units" || $c == "list-failed") { return $this->cmdListUnits($o); }
+        if ($c == "status") { return $this->cmdStatus($o); }
+        if ($c == "show") { return $this->cmdShow($o); }
+        if ($c == "is-active" || $c == "is-failed") { return $this->cmdPlain($o, $c); }
+        if ($c == "list-jobs") { return $this->cmdTable($o, ["list-jobs"], ["JOB", "UNIT", "TYPE", "STATE"], 4); }
+        if ($c == "list-timers") { return $this->cmdTimers($o); }
+        if ($c == "list-sockets") { return $this->cmdSockets($o); }
+        if ($c == "list-dependencies") { return $this->cmdDeps($o); }
+        if ($c == "analyze") { return $this->cmdAnalyze($o); }
+        if ($c == "daemon-reload" || $c == "daemon-reexec") { return $this->simple($o, [$c]); }
+        if ($c == "reset-failed") { return $this->simple($o, util.concat(["reset-failed"], $this->units($o))); }
+        if ($c == "isolate") { return $this->simple($o, util.concat(["isolate"], $this->units($o))); }
+        if ($c == "default") { return $this->simple($o, ["isolate", "default.target"]); }
+        if ($c == "rescue" || $c == "emergency") { return $this->simple($o, ["isolate", $c . ".target"]); }
+        if ($c == "poweroff" || $c == "reboot" || $c == "halt" || $c == "kexec") { return $this->simple($o, [$c]); }
+        if ($c == "kill") { return $this->cmdKill($o); }
+        if ($c == "show-environment" || $c == "set-environment" || $c == "unset-environment") { return $this->simple($o, util.concat([$c], $o->pos)); }
+        if ($c == "is-system-running") { return $this->cmdSystemRunning(); }
+        if ($c == "suspend" || $c == "hibernate" || $c == "hybrid-sleep" || $c == "edit" || $c == "preset" || $c == "link" || $c == "revert") {
+            $this->err("Polecenie '" . $c . "' nie jest obsługiwane przez zenitctl.\n");
+            return 1;
+        }
+        $this->err("Nieznane polecenie: " . $c . "\n");
+        return 1;
+    }
+
+    func usage() {
+        return "zenitctl [OPCJE] POLECENIE [JEDNOSTKA...]\n\n"
+            . "Jednostki:   start stop restart reload try-restart reload-or-restart kill reset-failed\n"
+            . "Informacje:  status show is-active is-failed list-units list-jobs list-timers list-sockets list-dependencies cat analyze\n"
+            . "Pliki:       enable disable mask unmask is-enabled list-unit-files get-default set-default\n"
+            . "System:      daemon-reload isolate default rescue emergency poweroff reboot halt kexec is-system-running\n\n"
+            . "Opcje: --user --no-block --now --no-reload -a -t TYP --state=S --failed -p WŁAŚCIWOŚĆ --value -n N --signal=S -q\n";
+    }
+
+    func units($o) {
+        $r = [];
+        foreach ($o->pos as $p) { $r[] = $this->unitArg($p); }
+        return $r;
+    }
+
+    func simple($o, $args) {
+        $r = $this->call($args);
+        if ($r == null) { return $this->notRunning(); }
+        if ($r[0] != 0) { $this->err($r[1]); return $r[0]; }
+        if (!$o->quiet && $r[1] != "") { $this->out($r[1]); }
+        return 0;
+    }
+
+    func cmdJobs($o) {
+        if (count($o->pos) == 0) { $this->err("Podaj nazwę jednostki.\n"); return 1; }
+        $args = util.concat([$o->cmd], $this->units($o));
+        if ($o->noBlock) { $args[] = "--no-block"; }
+        $r = $this->call($args);
+        if ($r == null) { return $this->notRunning(); }
+        if ($r[0] != 0) { $this->err($r[1]); return $r[0]; }
+        return 0;
+    }
+
+    func cmdKill($o) {
+        $args = util.concat(["kill"], $this->units($o));
+        if ($o->signal != "") { $args[] = "--signal=" . $o->signal; }
+        if ($o->killWhom != "") { $args[] = "--kill-whom=" . $o->killWhom; }
+        return $this->simple($o, $args);
+    }
+
+    # ───────────── pliki jednostek (offline) ─────────────
+
+    func reloadQuiet() {
+        $r = $this->call(["daemon-reload"]);
+        return 0;
+    }
+
+    func cmdEnable($o, $enable) {
+        if (count($o->pos) == 0) { $this->err("Podaj nazwę jednostki.\n"); return 1; }
+        $rc = 0;
+        foreach ($this->units($o) as $n) {
+            $msgs = [];
+            if ($enable) { $msgs = $this->loader->enable($n); } else { $msgs = $this->loader->disable($n); }
+            foreach ($msgs as $m) {
+                if (starts_with($m, "ERR: ")) { $this->err(substr($m, 5, strlen($m) - 5) . "\n"); $rc = 1; }
+                elseif (!$o->quiet) { $this->out($m . "\n"); }
+            }
+        }
+        if (!$o->noReload) { $this->reloadQuiet(); }
+        if ($o->now && $rc == 0) {
+            $a = util.concat([$enable ? "start" : "stop"], $this->units($o));
+            $r = $this->call($a);
+            if ($r == null) { return $this->notRunning(); }
+            if ($r[0] != 0) { $this->err($r[1]); return $r[0]; }
+        }
+        return $rc;
+    }
+
+    func cmdMask($o, $mask) {
+        $rc = 0;
+        foreach ($this->units($o) as $n) {
+            $msgs = $mask ? $this->loader->mask($n) : $this->loader->unmask($n);
+            foreach ($msgs as $m) {
+                if (starts_with($m, "ERR: ")) { $this->err(substr($m, 5, strlen($m) - 5) . "\n"); $rc = 1; }
+                elseif (!$o->quiet) { $this->out($m . "\n"); }
+            }
+        }
+        if (!$o->noReload) { $this->reloadQuiet(); }
+        return $rc;
+    }
+
+    func cmdIsEnabled($o) {
+        $rc = 1;
+        foreach ($this->units($o) as $n) {
+            $st = $this->loader->enableState($n);
+            if (!$o->quiet) { $this->out($st . "\n"); }
+            if ($st == "enabled" || $st == "static" || $st == "alias") { $rc = 0; }
+        }
+        return $rc;
+    }
+
+    func cmdCat($o) {
+        $rc = 0;
+        foreach ($this->units($o) as $n) {
+            $loc = $this->loader->locate($n);
+            if ($loc == null) { $this->err("Nie znaleziono " . $n . "\n"); $rc = 1; continue; }
+            $this->out("# " . $loc["path"] . "\n");
+            $t = $this->sys->readFile($loc["path"], 1048576);
+            if ($t != null) { $this->out(trim($t) . "\n"); }
+            $u = $this->loader->load($n);
+            foreach ($u->dropins as $d) {
+                $this->out("\n# " . $d . "\n");
+                $dt = $this->sys->readFile($d, 262144);
+                if ($dt != null) { $this->out(trim($dt) . "\n"); }
+            }
+        }
+        return $rc;
+    }
+
+    func enabledSet() {
+        $set = [];
+        foreach ($this->cfg->unitDirs as $d) {
+            $l = $this->sys->dirList($d);
+            if ($l == null) { continue; }
+            foreach ($l as $f) {
+                if (!ends_with($f, ".wants") && !ends_with($f, ".requires")) { continue; }
+                $inner = $this->sys->dirList(util.joinPath($d, $f));
+                if ($inner == null) { continue; }
+                foreach ($inner as $x) { $set[$x] = true; }
+            }
+        }
+        return $set;
+    }
+
+    func cmdListFiles($o) {
+        $set = $this->enabledSet();
+        $rows = [];
+        foreach ($this->loader->listFiles() as $f) {
+            $n = $f[0];
+            if ($o->types != "" && !util.contains_item(split($o->types, ","), util.unitType($n))) { continue; }
+            $st = "disabled";
+            if ($this->sys->stat($f[1]) == 3 && $this->sys->readlink($f[1]) == "/dev/null") { $st = "masked"; }
+            elseif (($set[$n] ?? false) == true) { $st = "enabled"; }
+            else {
+                $u = $this->loader->load($n);
+                if (count($u->wantedBy) == 0 && count($u->requiredBy) == 0 && count($u->aliases) == 0) { $st = "static"; }
+            }
+            if ($o->states != "" && !util.contains_item(split($o->states, ","), $st)) { continue; }
+            $rows[] = [$n, $st];
+        }
+        $this->printTable($o, ["UNIT FILE", "STATE"], $rows, 2);
+        if (!$o->noLegend) { $this->out("\n" . strval(count($rows)) . " plików jednostek.\n"); }
+        return 0;
+    }
+
+    func cmdSetDefault($o) {
+        if (count($o->pos) != 1) { $this->err("Podaj dokładnie jeden cel.\n"); return 1; }
+        $m = $this->loader->setDefault($this->unitArg($o->pos[0]));
+        if (starts_with($m, "ERR: ")) { $this->err(substr($m, 5, strlen($m) - 5) . "\n"); return 1; }
+        if (!$o->quiet) { $this->out($m . "\n"); }
+        return 0;
+    }
+
+    # ───────────── widoki ─────────────
+
+    func printTable($o, $head, $rows, $cols) {
+        $w = [];
+        $i = 0;
+        while ($i < $cols) { $w[] = strlen($head[$i]); $i += 1; }
+        foreach ($rows as $r) {
+            $i = 0;
+            while ($i < $cols) { $l = strlen($r[$i]); if ($l > $w[$i]) { $w[$i] = $l; } $i += 1; }
+        }
+        if (!$o->noLegend) {
+            $line = "";
+            $i = 0;
+            while ($i < $cols) {
+                if ($i == $cols - 1) { $line = $line . $head[$i]; } else { $line = $line . pad_right($head[$i], $w[$i] + 1, " "); }
+                $i += 1;
+            }
+            $this->out($this->paint("1", $line) . "\n");
+        }
+        foreach ($rows as $r) {
+            $line = "";
+            $i = 0;
+            while ($i < $cols) {
+                if ($i == $cols - 1) { $line = $line . $r[$i]; } else { $line = $line . pad_right($r[$i], $w[$i] + 1, " "); }
+                $i += 1;
+            }
+            $this->out($line . "\n");
+        }
+        return 0;
+    }
+
+    func cmdTable($o, $args, $head, $cols) {
+        $r = $this->call($args);
+        if ($r == null) { return $this->notRunning(); }
+        $rows = [];
+        foreach (split($r[1], "\n") as $l) { if ($l != "") { $rows[] = split($l, "\t"); } }
+        $this->printTable($o, $head, $rows, $cols);
+        if (!$o->noLegend) { $this->out("\n" . strval(count($rows)) . " pozycji.\n"); }
+        return 0;
+    }
+
+    func cmdListUnits($o) {
+        $args = ["list-units"];
+        if ($o->all) { $args[] = "--all"; }
+        if ($o->failed || $o->cmd == "list-failed") { $args[] = "--failed"; }
+        if ($o->types != "") { $args[] = "--type=" . $o->types; }
+        if ($o->states != "") { $args[] = "--state=" . $o->states; }
+        $r = $this->call($args);
+        if ($r == null) { return $this->notRunning(); }
+        $rows = [];
+        foreach (split($r[1], "\n") as $l) {
+            if ($l == "") { continue; }
+            $p = split($l, "\t");
+            $mark = " ";
+            if ($p[2] == "failed") { $mark = $this->paint("31", "●"); }
+            elseif ($p[2] == "active") { $mark = $this->paint("32", "●"); }
+            $rows[] = [$mark . " " . $p[0], $p[1], $p[2], $p[3], $p[4]];
+        }
+        $this->printTable($o, ["  UNIT", "LOAD", "ACTIVE", "SUB", "DESCRIPTION"], $rows, 5);
+        if (!$o->noLegend) { $this->out("\n" . strval(count($rows)) . " jednostek.\n"); }
+        return 0;
+    }
+
+    func kv($body) {
+        $m = [];
+        $multi = [];
+        foreach (split($body, "\n") as $l) {
+            $eq = index_of($l, "=");
+            if ($eq <= 0) { continue; }
+            $k = substr($l, 0, $eq);
+            $v = util.unescapeField(substr($l, $eq + 1, strlen($l) - $eq - 1));
+            $m[$k] = $v;
+            $list = $multi[$k] ?? [];
+            $list[] = $v;
+            $multi[$k] = $list;
+        }
+        return ["m" => $m, "multi" => $multi];
+    }
+
+    func cmdShow($o) {
+        if (count($o->pos) == 0) { $this->err("Podaj nazwę jednostki.\n"); return 1; }
+        $r = $this->call(["show", $this->unitArg($o->pos[0])]);
+        if ($r == null) { return $this->notRunning(); }
+        if ($r[0] != 0) { $this->err($r[1]); return $r[0]; }
+        if (count($o->props) == 0) {
+            foreach (split($r[1], "\n") as $l) {
+                if ($l == "") { continue; }
+                $eq = index_of($l, "=");
+                $this->out(substr($l, 0, $eq) . "=" . util.unescapeField(substr($l, $eq + 1, strlen($l) - $eq - 1)) . "\n");
+            }
+            return 0;
+        }
+        $d = $this->kv($r[1]);
+        foreach ($o->props as $p) {
+            $vals = $d["multi"][$p] ?? [];
+            foreach ($vals as $v) {
+                if ($o->value) { $this->out($v . "\n"); } else { $this->out($p . "=" . $v . "\n"); }
+            }
+        }
+        return 0;
+    }
+
+    func cmdPlain($o, $c) {
+        $r = $this->call(util.concat([$c], $this->units($o)));
+        if ($r == null) { if (!$o->quiet) { $this->out("inactive\n"); } return $c == "is-active" ? 3 : 1; }
+        if (!$o->quiet) { $this->out($r[1]); }
+        return $r[0];
+    }
+
+    func fmtTime($ms) {
+        if ($ms <= 0) { return "n/a"; }
+        $f = $this->sys->tm(intval($ms / 1000));
+        $days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        return $days[$f[6]] . " " . strval($f[0]) . "-" . util.twoDigits($f[1]) . "-" . util.twoDigits($f[2]) . " " . util.twoDigits($f[3]) . ":" . util.twoDigits($f[4]) . ":" . util.twoDigits($f[5]);
+    }
+
+    func cmdStatus($o) {
+        if (count($o->pos) == 0) { return $this->systemOverview($o); }
+        $rc = 0;
+        $first = true;
+        foreach ($this->units($o) as $n) {
+            if (!$first) { $this->out("\n"); }
+            $first = false;
+            $r = $this->call(["show", $n]);
+            if ($r == null) {
+                # offline: pokaż informacje z plików
+                $u = $this->loader->load($n);
+                if ($u->loadError != "") { $this->err("Jednostka " . $n . " nie została znaleziona.\n"); $rc = 4; continue; }
+                $this->out($this->paint("0", "○") . " " . $n . " - " . $u->description . "\n     Loaded: loaded (" . $u->path . "; " . $this->loader->enableState($n) . ")\n     Active: inactive (zenitd nie działa)\n");
+                $rc = 3;
+                continue;
+            }
+            $d = $this->kv($r[1]);
+            $m = $d["m"];
+            if (($m["LoadState"] ?? "") != "loaded") {
+                $this->err("Jednostka " . $n . " nie została znaleziona (" . ($m["LoadState"] ?? "?") . ").\n");
+                $rc = 4;
+                continue;
+            }
+            $st = $m["ActiveState"] ?? "inactive";
+            $sub = $m["SubState"] ?? "dead";
+            $dot = "○";
+            if ($st == "active") { $dot = $this->paint("32", "●"); }
+            elseif ($st == "failed") { $dot = $this->paint("31", "●"); }
+            elseif ($st == "activating" || $st == "deactivating") { $dot = $this->paint("33", "●"); }
+            $this->out($dot . " " . $n . " - " . ($m["Description"] ?? "") . "\n");
+            $this->out("     Loaded: loaded (" . ($m["FragmentPath"] ?? "") . "; " . ($m["UnitFileState"] ?? "") . ")\n");
+            if (($m["DropInPaths"] ?? "") != "") { $this->out("    Drop-In: " . $m["DropInPaths"] . "\n"); }
+            $stc = $st;
+            if ($st == "active") { $stc = $this->paint("32", $st); } elseif ($st == "failed") { $stc = $this->paint("31", $st); }
+            $line = "     Active: " . $stc . " (" . $sub . ")";
+            $since = util.parseInt($m["ActiveEnterTimestamp"] ?? "0", 0);
+            if ($st == "active" && $since > 0) {
+                $line = $line . " since " . $this->fmtTime($since) . "; " . util.fmtDuration($this->sys->realMs() - $since) . " ago";
+            }
+            if ($st == "failed" && ($m["Result"] ?? "") != "") { $line = $line . "; result: " . $m["Result"]; }
+            $this->out($line . "\n");
+            if (($m["ConditionFailed"] ?? "") != "") { $this->out("  Condition: " . $m["ConditionFailed"] . "\n"); }
+            if (($m["Triggers"] ?? "") != "") { $this->out("   Triggers: " . $m["Triggers"] . "\n"); }
+            foreach (($d["multi"]["Listen"] ?? []) as $l) { $this->out("     Listen: " . $l . "\n"); }
+            $pid = util.parseInt($m["MainPID"] ?? "0", 0);
+            if ($pid > 0) {
+                $comm = $this->sys->readFile("/proc/" . strval($pid) . "/comm", 64);
+                $this->out("   Main PID: " . strval($pid) . ($comm != null ? " (" . trim($comm) . ")" : "") . "\n");
+            }
+            if (($m["TasksCurrent"] ?? "0") != "0" && ($m["TasksCurrent"] ?? "") != "") { $this->out("      Tasks: " . $m["TasksCurrent"] . "\n"); }
+            $mem = util.parseInt($m["MemoryCurrent"] ?? "-1", -1);
+            if ($mem >= 0) { $this->out("     Memory: " . util.fmtBytes($mem) . "\n"); }
+            if (util.parseInt($m["NRestarts"] ?? "0", 0) > 0) { $this->out("   Restarts: " . $m["NRestarts"] . "\n"); }
+            if (($m["StatusText"] ?? "") != "") { $this->out("     Status: \"" . $m["StatusText"] . "\"\n"); }
+            if (($m["FailureMessage"] ?? "") != "") { $this->out("      Error: " . $m["FailureMessage"] . "\n"); }
+            if (($m["ControlGroup"] ?? "") != "") {
+                $this->out("     CGroup: " . $m["ControlGroup"] . "\n");
+                foreach (($d["multi"]["Process"] ?? []) as $p) { $this->out("             └─" . $p . "\n"); }
+            }
+            foreach (($d["multi"]["Warning"] ?? []) as $w) { $this->out($this->paint("33", "  Uwaga: " . $w) . "\n"); }
+            $this->printLog($n, $o->lines);
+            if ($st != "active") { $rc = ($st == "failed") ? 3 : 3; }
+        }
+        return $rc;
+    }
+
+    func printLog($unitName, $lines) {
+        if ($lines <= 0) { return 0; }
+        $all = journal.readEntries($this->sys, $this->cfg->volatileLogDir, $this->cfg->logKeep);
+        if (count($all) == 0) { $all = journal.readEntries($this->sys, $this->cfg->persistLogDir, $this->cfg->logKeep); }
+        $sel = journal.tail(journal.filter($all, $unitName, 7, 0, ""), $lines);
+        if (count($sel) == 0) { return 0; }
+        $this->out("\n");
+        foreach ($sel as $e) { $this->out(journal.fmtShort($e, $this->sys, $this->host) . "\n"); }
+        return 0;
+    }
+
+    func systemOverview($o) {
+        $r = $this->call(["list-units", "--failed"]);
+        if ($r == null) { return $this->notRunning(); }
+        $failed = 0;
+        foreach (split($r[1], "\n") as $l) { if ($l != "") { $failed += 1; } }
+        $up = $this->call(["uptime"]);
+        $this->out("● " . $this->host . "\n");
+        $this->out("    State: " . ($failed > 0 ? "degraded" : "running") . "\n");
+        $this->out("   Failed: " . strval($failed) . " jednostek\n");
+        return 0;
+    }
+
+    func cmdSystemRunning() {
+        $r = $this->call(["list-jobs"]);
+        if ($r == null) { $this->out("offline\n"); return 1; }
+        $jobs = 0;
+        foreach (split($r[1], "\n") as $l) { if ($l != "") { $jobs += 1; } }
+        if ($jobs > 0) { $this->out("starting\n"); return 1; }
+        $f = $this->call(["list-units", "--failed"]);
+        $nf = 0;
+        if ($f != null) { foreach (split($f[1], "\n") as $l) { if ($l != "") { $nf += 1; } } }
+        if ($nf > 0) { $this->out("degraded\n"); return 1; }
+        $this->out("running\n");
+        return 0;
+    }
+
+    func cmdTimers($o) {
+        $r = $this->call(["list-timers"]);
+        if ($r == null) { return $this->notRunning(); }
+        $now = $this->sys->realMs();
+        $rows = [];
+        foreach (split($r[1], "\n") as $l) {
+            if ($l == "") { continue; }
+            $p = split($l, "\t");
+            $next = util.parseInt($p[1], 0);
+            $left = $next > 0 ? "za " . util.fmtDuration($next - $now) : "n/a";
+            $rows[] = [$next > 0 ? $this->fmtTime($next) : "n/a", $left, $this->fmtTime(util.parseInt($p[2], 0)), $p[0], $p[3]];
+        }
+        $this->printTable($o, ["NEXT", "LEFT", "LAST", "UNIT", "ACTIVATES"], $rows, 5);
+        return 0;
+    }
+
+    func cmdSockets($o) {
+        $r = $this->call(["list-sockets"]);
+        if ($r == null) { return $this->notRunning(); }
+        $rows = [];
+        foreach (split($r[1], "\n") as $l) { if ($l != "") { $p = split($l, "\t"); $rows[] = [$p[0], $p[1], $p[2]]; } }
+        $this->printTable($o, ["LISTEN", "UNIT", "ACTIVATES"], $rows, 3);
+        return 0;
+    }
+
+    func cmdDeps($o) {
+        $args = ["list-dependencies"];
+        if (count($o->pos) > 0) { $args[] = $this->unitArg($o->pos[0]); }
+        if ($o->reverse) { $args[] = "--reverse"; }
+        $r = $this->call($args);
+        if ($r == null) { return $this->notRunning(); }
+        if ($r[0] != 0) { $this->err($r[1]); return $r[0]; }
+        foreach (split($r[1], "\n") as $l) {
+            if ($l == "") { continue; }
+            $p = split($l, "\t");
+            $d = util.parseInt($p[0], 0);
+            $mark = $p[2] == "active" ? $this->paint("32", "●") : ($p[2] == "failed" ? $this->paint("31", "●") : "○");
+            $this->out(repeat("  ", $d) . $mark . " " . $p[1] . "\n");
+        }
+        return 0;
+    }
+
+    func cmdAnalyze($o) {
+        $sub = count($o->pos) > 0 ? $o->pos[0] : "time";
+        $r = $this->call(["blame"]);
+        if ($r == null) { return $this->notRunning(); }
+        $rows = [];
+        $up = 0;
+        foreach (split($r[1], "\n") as $l) {
+            if ($l == "") { continue; }
+            if (starts_with($l, "#uptime")) { $up = util.parseInt(substr($l, 8, strlen($l) - 8), 0); continue; }
+            $p = split($l, "\t");
+            $rows[] = [util.parseInt($p[0], 0), $p[1]];
+        }
+        if ($sub == "time") { $this->out("Czas od startu zenitd: " . util.fmtDuration($up) . "\n"); return 0; }
+        if ($sub != "blame") { $this->err("Nieznane polecenie analyze: " . $sub . "\n"); return 1; }
+        $i = 0;
+        $n = count($rows);
+        while ($i < $n) {
+            $j = $i + 1;
+            while ($j < $n) {
+                if ($rows[$j][0] > $rows[$i][0]) { $t = $rows[$i]; $rows[$i] = $rows[$j]; $rows[$j] = $t; }
+                $j += 1;
+            }
+            $i += 1;
+        }
+        foreach ($rows as $row) { $this->out(pad_left(util.fmtDuration($row[0]), 10, " ") . " " . $row[1] . "\n"); }
+        return 0;
+    }
+}

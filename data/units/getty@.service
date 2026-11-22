@@ -1,0 +1,16 @@
+[Unit]
+Description=Konsola logowania na %I
+After=basic.target
+ConditionPathExists=/dev/%I
+[Service]
+ExecStart=-/sbin/agetty -o '-p -- \u' --noclear %I linux
+Type=idle
+Restart=always
+RestartSec=0
+UtmpIdentifier=%I
+TTYPath=/dev/%I
+StandardInput=tty
+StandardOutput=tty
+[Install]
+WantedBy=getty.target
+DefaultInstance=tty1

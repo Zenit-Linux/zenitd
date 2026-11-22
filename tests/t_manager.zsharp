@@ -1,0 +1,148 @@
+import Workspace.sys;
+import Workspace.util;
+import Workspace.config;
+import Workspace.manager;
+
+func eq($name, $got, $want) {
+    if ($got == $want) { echo "ok   " . $name; return 0; }
+    echo "FAIL " . $name . " got=" . strval($got) . " want=" . strval($want);
+    return 1;
+}
+func pump($m, $n) { $i = 0; while ($i < $n) { $m->iterate(0); $i += 1; } }
+
+$f = 0;
+$s = new Sys();
+$u = "/usr/lib/zenit/system/";
+$s->addFile($u . "basic.target", "[Unit]\nDescription=Basic\n");
+$s->addFile($u . "shutdown.target", "[Unit]\nDescription=Shutdown\n");
+$s->addFile($u . "multi-user.target", "[Unit]\nDescription=Multi\nRequires=basic.target\nAfter=basic.target\nWants=app.service db.service init.service nfy.service\nAllowIsolate=yes\n");
+$s->addFile($u . "db.service", "[Service]\nExecStart=/bin/db --serve\nExecStartPre=/bin/dbprep\n");
+$s->addFile($u . "app.service", "[Unit]\nRequires=db.service\nAfter=db.service\n[Service]\nExecStart=/bin/app\nRestart=on-failure\nRestartSec=1s\nExecReload=/bin/appreload\n");
+$s->addFile($u . "init.service", "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/initjob\n");
+$s->addFile($u . "nfy.service", "[Service]\nType=notify\nExecStart=/bin/nfy\n");
+$s->addFile($u . "flap.service", "[Service]\nExecStart=/bin/flap\nRestart=always\nRestartSec=0\n");
+$s->addFile($u . "skip.service", "[Unit]\nConditionPathExists=/nie/ma\n[Service]\nExecStart=/bin/skip\n");
+
+$cfg = config.load($s, "system", ["HOME" => "/root"]);
+$m = new Manager($s, $cfg);
+$m->setup();
+$m->startBoot("multi-user.target");
+
+# db wymaga ExecStartPre -> spawn control process
+$f += eq("1st spawn is dbprep", $s->spawned[0]["path"], "/bin/dbprep");
+$s->exitProc($s->spawnPids[0], 0);
+pump($m, 3);
+$paths = [];
+foreach ($s->spawned as $sp) { $paths[] = $sp["path"]; }
+$f += eq("db main after pre", util.contains_item($paths, "/bin/db"), true);
+$f += eq("app after db", util.contains_item($paths, "/bin/app"), true);
+$f += eq("db before app", array_idx($paths, "/bin/db") < array_idx($paths, "/bin/app"), true);
+$f += eq("db active", $m->runtimeFor("db.service")->state, "active");
+$f += eq("app active", $m->runtimeFor("app.service")->state, "active");
+$f += eq("oneshot activating", $m->runtimeFor("init.service")->state, "activating");
+$f += eq("notify activating", $m->runtimeFor("nfy.service")->state, "activating");
+$f += eq("target waits", $m->runtimeFor("multi-user.target")->state, "inactive");
+
+# oneshot kończy się
+$ip = pidOf($m, "init.service");
+$s->exitProc($ip, 0);
+pump($m, 2);
+$f += eq("oneshot remain active/exited", $m->runtimeFor("init.service")->state . "/" . $m->runtimeFor("init.service")->sub, "active/exited");
+# notify READY
+$m->runtimeFor("nfy.service")->onNotify($m, ["READY" => "1", "STATUS" => "gotowe"]);
+pump($m, 2);
+$f += eq("notify active", $m->runtimeFor("nfy.service")->state, "active");
+$f += eq("notify status text", $m->runtimeFor("nfy.service")->statusText, "gotowe");
+$f += eq("boot target active", $m->runtimeFor("multi-user.target")->state, "active");
+$f += eq("jobs drained", count($m->pendingJobsPublic()), 0);
+
+# crash app -> auto-restart
+$ap = pidOf($m, "app.service");
+$s->exitProc($ap, 1);
+pump($m, 2);
+$f += eq("app auto-restart", $m->runtimeFor("app.service")->sub, "auto-restart");
+$s->advance(1100);
+pump($m, 2);
+$f += eq("app restarted active", $m->runtimeFor("app.service")->state, "active");
+$f += eq("app restarts counter", $m->runtimeFor("app.service")->restarts, 1);
+$f += eq("new pid", pidOf($m, "app.service") != $ap, true);
+
+# reload
+$m->submit("app.service", "reload", "manual");
+pump($m, 1);
+$f += eq("reload spawns ExecReload", $s->lastSpawn()["path"], "/bin/appreload");
+$s->exitProc($m->runtimeFor("app.service")->controlPid, 0);
+pump($m, 2);
+$f += eq("back to running", $m->runtimeFor("app.service")->sub, "running");
+
+# stop db => stops app first (Requires)
+$r = $m->submit("db.service", "stop", "manual");
+pump($m, 6);
+$f += eq("db inactive", $m->runtimeFor("db.service")->state, "inactive");
+$f += eq("app inactive", $m->runtimeFor("app.service")->state, "inactive");
+$f += eq("stop jobs done", count($m->pendingJobsPublic()), 0);
+
+# restart db (+ start app not auto)
+$m->submit("db.service", "start", "manual");
+$sp0 = count($s->spawned);
+pump($m, 2);
+$f += eq("db pre again", $s->lastSpawn()["path"], "/bin/dbprep");
+$s->exitProc($m->runtimeFor("db.service")->controlPid, 0);
+pump($m, 3);
+$f += eq("db active again", $m->runtimeFor("db.service")->state, "active");
+
+# warunek niespełniony
+$r = $m->submit("skip.service", "start", "manual");
+pump($m, 2);
+$f += eq("condition skipped", $m->runtimeFor("skip.service")->sub, "condition-failed");
+$f += eq("skipped job done", count($m->pendingJobsPublic()), 0);
+
+# start-limit
+$m->submit("flap.service", "start", "manual");
+$i = 0;
+while ($i < 12 && $m->runtimeFor("flap.service")->state != "failed") {
+    $pid = pidOf($m, "flap.service");
+    if ($pid > 0) { $s->exitProc($pid, 1); }
+    pump($m, 2);
+    $s->advance(5);
+    pump($m, 1);
+    $i += 1;
+}
+$f += eq("start-limit-hit", $m->runtimeFor("flap.service")->sub, "start-limit-hit");
+
+# błąd spawnu
+$s->addFile($u . "bad.service", "[Service]\nExecStart=/nie/ma\n");
+$s->failSpawn = -2;
+$m->submit("bad.service", "start", "manual");
+pump($m, 3);
+$f += eq("spawn failure -> failed", $m->runtimeFor("bad.service")->state, "failed");
+
+# komendy kontroli
+$m->control->conns[77] = ["buf" => new ReqBuf(), "uid" => 0, "wait" => null];
+$r = $m->control->handle(77, ["is-active", "db.service"]);
+$f += eq("ctl is-active", $r[0] . ":" . trim($r[1]), "0:active");
+$r = $m->control->handle(77, ["is-active", "app.service"]);
+$f += eq("ctl is-active inactive", $r[0], 3);
+$r = $m->control->handle(77, ["list-units", "--all"]);
+$f += eq("ctl list-units has db", contains($r[1], "db.service\tloaded\tactive\trunning"), true);
+$r = $m->control->handle(77, ["show", "db.service"]);
+$f += eq("ctl show MainPID", contains($r[1], "MainPID="), true);
+$m->control->conns[78] = ["buf" => new ReqBuf(), "uid" => 1000, "wait" => null];
+$r = $m->control->handle(78, ["stop", "db.service"]);
+$f += eq("ctl non-root denied", $r[0], 4);
+$r = $m->control->handle(77, ["start", "nie-istnieje.service"]);
+$f += eq("ctl start missing", $r[0], 1);
+$r = $m->control->handle(77, ["start", "app.service"]);
+$f += eq("ctl start deferred", $r, null);
+pump($m, 2);
+
+# zamykanie
+$m->beginShutdown("exit");
+$i = 0;
+while ($m->running && $i < 30) { pump($m, 1); $i += 1; }
+$f += eq("shutdown finished", $m->running, false);
+$f += eq("no running units", $m->anyRunningPublic(), false);
+exit($f);
+
+func array_idx($arr, $v) { $i = 0; foreach ($arr as $x) { if ($x == $v) { return $i; } $i += 1; } return -1; }
+func pidOf($m, $name) { $r = $m->runtimeFor($name); if ($r->mainPid > 0) { return $r->mainPid; } return $r->controlPid; }

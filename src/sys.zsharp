@@ -1,0 +1,972 @@
+import Workspace.mem;
+
+class Sys {
+    public $m;          # Mem
+    public $arch;
+    public $rbuf;       # bufor odczytu 64 KiB
+    public $evbuf;      # bufor epoll (64 zdarzenia)
+    public $sibuf;      # signalfd_siginfo
+    public $sbuf;       # struct stat
+    public $lastStatus = 0;
+    public $lastPeer = 0;
+    public $spawnStage = "";
+
+    public func __construct() {
+        $this->m = new Mem();
+        $this->arch = System.architecture();
+        $this->rbuf = $this->m->alloc(65536 + 16);
+        $this->evbuf = $this->m->alloc(64 * 16);
+        $this->sibuf = $this->m->alloc(256);
+        $this->sbuf = $this->m->alloc(512);
+    }
+
+    # ───────────── podstawy ─────────────
+    public func errno() { return $this->m->peeki32(__errno_location()); }
+    public func fail() { return 0 - $this->errno(); }
+    public func errstr($e) {
+        if ($e < 0) { $e = 0 - $e; }
+        return strerror($e);
+    }
+    public func isX86() { return $this->arch == "x86_64"; }
+    public func pid() { return getpid(); }
+    public func uid() { return mem.i32(getuid()); }
+    public func ppid() { return getppid(); }
+
+    # ───────────── czas ─────────────
+    public func clockMs($clk) {
+        $ts = $this->m->alloc(16);
+        clock_gettime($clk, $ts);
+        $ms = $this->m->peek64($ts) * 1000 + intval($this->m->peek64($ts + 8) / 1000000);
+        $this->m->release($ts);
+        return $ms;
+    }
+    public func monoMs() { return $this->clockMs(1); }
+    public func realMs() { return $this->clockMs(0); }
+
+    public func sleepMs($ms) {
+        $ts = $this->m->alloc(16);
+        $this->m->poke64($ts, intval($ms / 1000));
+        $this->m->poke64($ts + 8, ($ms % 1000) * 1000000);
+        nanosleep($ts, 0);
+        $this->m->release($ts);
+    }
+
+    # pola czasu lokalnego: 0 rok,1 mies(1-12),2 dzień,3 godz,4 min,5 sek,6 dzień tyg (0=nd),7 dzień roku,8 offset UTC
+    public func tm($sec) {
+        $tp = $this->m->alloc(8);
+        $tmb = $this->m->alloc(64);
+        $this->m->poke64($tp, $sec);
+        localtime_r($tp, $tmb);
+        $m = $this->m;
+        $r = [$m->peeki32($tmb + 20) + 1900, $m->peeki32($tmb + 16) + 1, $m->peeki32($tmb + 12),
+              $m->peeki32($tmb + 8), $m->peeki32($tmb + 4), $m->peeki32($tmb),
+              $m->peeki32($tmb + 24), $m->peeki32($tmb + 28), $m->peek64($tmb + 40)];
+        $m->release($tp); $m->release($tmb);
+        return $r;
+    }
+
+    public func mktime($y, $mo, $d, $h, $mi, $s) {
+        $tmb = $this->m->alloc(64);
+        $m = $this->m;
+        $m->poke32($tmb, $s); $m->poke32($tmb + 4, $mi); $m->poke32($tmb + 8, $h);
+        $m->poke32($tmb + 12, $d); $m->poke32($tmb + 16, $mo - 1); $m->poke32($tmb + 20, $y - 1900);
+        $m->poke32($tmb + 32, 4294967295);
+        $t = mktime($tmb);
+        $m->release($tmb);
+        return $t;
+    }
+
+    # ───────────── procesy ─────────────
+    public func kill($pid, $sig) {
+        if (mem.i32(kill($pid, $sig)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func alive($pid) {
+        if ($pid <= 0) { return false; }
+        if (mem.i32(kill($pid, 0)) == 0) { return true; }
+        return $this->errno() == 1;
+    }
+    public func subreaper() {
+        if (mem.i32(prctl(36, 1, 0, 0, 0)) < 0) { return $this->fail(); }
+        return 0;
+    }
+
+    # >0 pid zakończonego dziecka (status w lastStatus), 0 brak, -1 brak dzieci
+    public func reap() {
+        $sp = $this->m->alloc(8);
+        $p = mem.i32(waitpid(-1, $sp, 1));
+        if ($p < 0) {
+            $this->m->release($sp);
+            if ($this->errno() == 10) { return -1; }
+            return 0;
+        }
+        if ($p > 0) {
+            $st = $this->m->peek32($sp);
+            $sig = $st & 127;
+            if ($sig == 0) { $this->lastStatus = ($st >> 8) & 255; }
+            elseif ($sig != 127) {
+                $this->lastStatus = 256 + $sig;
+                if (($st & 128) != 0) { $this->lastStatus += 512; }
+            } else { $this->lastStatus = 0; }
+        }
+        $this->m->release($sp);
+        return $p;
+    }
+
+    public func execv($path, $argv) {
+        $a = $this->m->strarray($argv);
+        $e = $this->m->alloc(8);
+        $r = execve($path, $a, $e);
+        return $this->fail();
+    }
+
+    # ───────────── sygnały i epoll ─────────────
+    public func signalfd($list) {
+        $set = $this->m->alloc(256);
+        sigemptyset($set);
+        foreach ($list as $s) { sigaddset($set, $s); }
+        if (mem.i32(sigprocmask(0, $set, 0)) < 0) { return $this->fail(); }
+        $fd = mem.i32(signalfd(-1, $set, 2048 | 524288));
+        $this->m->release($set);
+        if ($fd < 0) { return $this->fail(); }
+        return $fd;
+    }
+    public func signalRead($fd) {
+        $n = read($fd, $this->sibuf, 128);
+        if ($n != 128) { return 0; }
+        return $this->m->peek32($this->sibuf);
+    }
+    public func ignoreSigpipe() { signal(13, 1); }
+
+    public func epollCreate() {
+        $fd = mem.i32(epoll_create1(524288));
+        if ($fd < 0) { return $this->fail(); }
+        return $fd;
+    }
+    # op: 1 add, 2 del, 3 mod; events: 1 IN, 2 OUT
+    public func epollCtl($ep, $op, $fd, $events) {
+        $ev = $this->m->alloc(16);
+        $f = 0;
+        if (($events & 1) != 0) { $f = $f | 1; }
+        if (($events & 2) != 0) { $f = $f | 4; }
+        $this->m->poke32($ev, $f);
+        $off = 8;
+        if ($this->isX86()) { $off = 4; }
+        $this->m->poke32($ev + $off, $fd);
+        $r = mem.i32(epoll_ctl($ep, $op, $fd, $ev));
+        $this->m->release($ev);
+        if ($r < 0) { return $this->fail(); }
+        return 0;
+    }
+    # zwraca listę [fd, flagi]; flagi: 1 IN, 2 OUT, 4 ERR/HUP
+    public func epollWait($ep, $timeoutMs) {
+        $n = mem.i32(epoll_wait($ep, $this->evbuf, 64, $timeoutMs));
+        $out = [];
+        if ($n <= 0) { return $out; }
+        $stride = 16; $off = 8;
+        if ($this->isX86()) { $stride = 12; $off = 4; }
+        $i = 0;
+        while ($i < $n) {
+            $e = $this->m->peek32($this->evbuf + $i * $stride);
+            $fl = 0;
+            if (($e & 1) != 0) { $fl = $fl | 1; }
+            if (($e & 4) != 0) { $fl = $fl | 2; }
+            if (($e & 24) != 0) { $fl = $fl | 4; }
+            $out[] = [$this->m->peeki32($this->evbuf + $i * $stride + $off), $fl];
+            $i += 1;
+        }
+        return $out;
+    }
+
+    # ───────────── deskryptory ─────────────
+    # flagi: r w a (+) n(nonblock) p(prywatny 0600)
+    public func open($path, $flags) {
+        $f = 524288 | 256;
+        $mode = 420;
+        if (contains($flags, "w")) { $f = $f | 1 | 64 | 512; }
+        elseif (contains($flags, "a")) { $f = $f | 1 | 64 | 1024; }
+        if (contains($flags, "n")) { $f = $f | 2048; }
+        if (contains($flags, "p")) { $mode = 384; }
+        $fd = mem.i32(open($path, $f, $mode));
+        if ($fd < 0) { return $this->fail(); }
+        return $fd;
+    }
+    public func close($fd) { return mem.i32(close($fd)); }
+
+    # string | "" (brak danych teraz) | null (EOF / błąd)
+    public func read($fd, $max) {
+        if ($max > 65536) { $max = 65536; }
+        if ($max < 1) { $max = 1; }
+        $n = read($fd, $this->rbuf, $max);
+        if ($n < 0) {
+            $e = $this->errno();
+            if ($e == 11 || $e == 4) { return ""; }
+            return null;
+        }
+        if ($n == 0) { return null; }
+        $this->m->poke8($this->rbuf + $n, 0);
+        $s = strstr($this->rbuf, "");
+        if (strlen($s) < $n) {
+            $this->scrubNul($n);
+            $s = strstr($this->rbuf, "");
+        }
+        return $s;
+    }
+    func scrubNul($n) {
+        $i = 0;
+        while ($i < $n) {
+            if ($this->m->peek8($this->rbuf + $i) == 0) { $this->m->poke8($this->rbuf + $i, 32); }
+            $i += 1;
+        }
+    }
+    public func write($fd, $data) {
+        $n = write($fd, $data, strlen($data));
+        if ($n < 0) { return $this->fail(); }
+        return $n;
+    }
+    # pełny zapis z limitem czasu (gniazda i pliki); 0 albo -errno
+    public func writeAll($fd, $data, $timeoutMs) {
+        $left = strlen($data);
+        $off = 0;
+        $deadline = $this->monoMs() + $timeoutMs;
+        while ($left > 0) {
+            $chunk = $data;
+            if ($off > 0) { $chunk = substr($data, $off, $left); }
+            $n = send($fd, $chunk, $left, 16448);
+            if ($n < 0 && $this->errno() == 88) { $n = write($fd, $chunk, $left); }
+            if ($n >= 0) { $off += $n; $left -= $n; }
+            else {
+                $e = $this->errno();
+                if ($e == 4) { continue; }
+                if ($e != 11) { return 0 - $e; }
+                $rem = $deadline - $this->monoMs();
+                if ($rem <= 0) { return -110; }
+                $this->pollFd($fd, 4, $rem);
+            }
+        }
+        return 0;
+    }
+    # poll jednego fd; events: 1 IN, 4 OUT; zwraca 1/0/-errno
+    func pollFd($fd, $events, $timeoutMs) {
+        $pf = $this->m->alloc(8);
+        $this->m->poke32($pf, $fd);
+        $this->m->poke16($pf + 4, $events);
+        $r = mem.i32(poll($pf, 1, $timeoutMs));
+        $this->m->release($pf);
+        if ($r < 0) {
+            if ($this->errno() == 4) { return 0; }
+            return $this->fail();
+        }
+        if ($r > 0) { return 1; }
+        return 0;
+    }
+    public func waitReadable($fd, $timeoutMs) { return $this->pollFd($fd, 1, $timeoutMs); }
+
+    # [odczyt, zapis]
+    public func pipe() {
+        $b = $this->m->alloc(8);
+        if (mem.i32(pipe2($b, 524288)) < 0) { $this->m->release($b); return null; }
+        $r = $this->m->peeki32($b);
+        $w = $this->m->peeki32($b + 4);
+        $this->m->release($b);
+        $this->nonblock($r);
+        return [$r, $w];
+    }
+    # rura z BLOKUJĄCYM końcem odczytu (do synchronizacji z exec w spawn)
+    public func pipeBlocking() {
+        $b = $this->m->alloc(8);
+        if (mem.i32(pipe2($b, 524288)) < 0) { $this->m->release($b); return null; }
+        $r = $this->m->peeki32($b);
+        $w = $this->m->peeki32($b + 4);
+        $this->m->release($b);
+        return [$r, $w];
+    }
+    public func nonblock($fd) {
+        $f = mem.i32(fcntl($fd, 3, 0));
+        if ($f < 0) { return $this->fail(); }
+        fcntl($fd, 4, $f | 2048);
+        return 0;
+    }
+    public func isatty($fd) { return mem.i32(isatty($fd)) == 1; }
+
+    # ───────────── gniazda ─────────────
+    func unixAddr($path) {
+        $a = $this->m->alloc(112);
+        $this->m->poke16($a, 1);
+        $n = strlen($path);
+        if ($n > 107) { return [0, 0]; }
+        if (starts_with($path, "@")) {
+            $this->m->put($a + 3, substr($path, 1, $n - 1));
+            return [$a, 2 + $n];
+        }
+        $this->m->put($a + 2, $path);
+        return [$a, 3 + $n];
+    }
+    func bindUnix($fd, $path, $mode) {
+        $ad = $this->unixAddr($path);
+        if ($ad[0] == 0) { return -36; }
+        if (!starts_with($path, "@")) { unlink($path); }
+        $old = mem.i32(umask(511 & ~$mode));
+        $r = mem.i32(bind($fd, $ad[0], $ad[1]));
+        $e = $this->errno();
+        umask($old);
+        $this->m->release($ad[0]);
+        if ($r < 0) { return 0 - $e; }
+        return 0;
+    }
+    func abort($fd, $err) { close($fd); return $err; }
+
+    public func listenUnix($path, $mode, $backlog) {
+        $fd = mem.i32(socket(1, 1 | 524288 | 2048, 0));
+        if ($fd < 0) { return $this->fail(); }
+        $r = $this->bindUnix($fd, $path, $mode);
+        if ($r < 0) { return $this->abort($fd, $r); }
+        if (mem.i32(listen($fd, $backlog)) < 0) { return $this->abort($fd, $this->fail()); }
+        return $fd;
+    }
+    public func listenTcp($host, $port, $backlog) {
+        $v6 = ($host == "" || $host == "*" || contains($host, ":"));
+        $fam = 2;
+        if ($v6) { $fam = 10; }
+        $fd = mem.i32(socket($fam, 1 | 524288 | 2048, 0));
+        if ($fd < 0 && $v6 && ($host == "" || $host == "*")) { $fam = 2; $v6 = false; $fd = mem.i32(socket(2, 1 | 524288 | 2048, 0)); }
+        if ($fd < 0) { return $this->fail(); }
+        $one = $this->m->alloc(8);
+        $this->m->poke32($one, 1);
+        setsockopt($fd, 1, 2, $one, 4);
+        $a = $this->m->alloc(32);
+        $len = 16;
+        if ($v6) {
+            $len = 28;
+            $this->m->poke16($a, 10);
+            $this->m->poke8($a + 2, $port >> 8); $this->m->poke8($a + 3, $port);
+            if ($host != "" && $host != "*") {
+                if (mem.i32(inet_pton(10, $host, $a + 8)) != 1) { return $this->abort($fd, -22); }
+            } else {
+                $zero = $this->m->alloc(8);
+                setsockopt($fd, 41, 26, $zero, 4);
+            }
+        } else {
+            $this->m->poke16($a, 2);
+            $this->m->poke8($a + 2, $port >> 8); $this->m->poke8($a + 3, $port);
+            if ($host != "" && $host != "*") {
+                if (mem.i32(inet_pton(2, $host, $a + 4)) != 1) { return $this->abort($fd, -22); }
+            }
+        }
+        $r = mem.i32(bind($fd, $a, $len));
+        $e = $this->errno();
+        $this->m->release($a); $this->m->release($one);
+        if ($r < 0) { return $this->abort($fd, 0 - $e); }
+        if (mem.i32(listen($fd, $backlog)) < 0) { return $this->abort($fd, $this->fail()); }
+        return $fd;
+    }
+    public func bindDgram($path, $mode) {
+        $fd = mem.i32(socket(1, 2 | 524288 | 2048, 0));
+        if ($fd < 0) { return $this->fail(); }
+        $rb = $this->m->alloc(8);
+        $this->m->poke32($rb, 4194304);
+        setsockopt($fd, 1, 8, $rb, 4);
+        $this->m->release($rb);
+        $r = $this->bindUnix($fd, $path, $mode);
+        if ($r < 0) { return $this->abort($fd, $r); }
+        return $fd;
+    }
+    public func accept($fd) {
+        $c = mem.i32(accept4($fd, 0, 0, 524288 | 2048));
+        if ($c < 0) { return $this->fail(); }
+        return $c;
+    }
+    func connectKind($path, $type) {
+        $fd = mem.i32(socket(1, $type | 524288, 0));
+        if ($fd < 0) { return $this->fail(); }
+        $ad = $this->unixAddr($path);
+        if ($ad[0] == 0) { return $this->abort($fd, -36); }
+        $r = mem.i32(connect($fd, $ad[0], $ad[1]));
+        $e = $this->errno();
+        $this->m->release($ad[0]);
+        if ($r < 0) { return $this->abort($fd, 0 - $e); }
+        return $fd;
+    }
+    public func connectUnix($path) { return $this->connectKind($path, 1); }
+    public func connectDgram($path) { return $this->connectKind($path, 2); }
+
+    public func recv($fd) {
+        $n = recv($fd, $this->rbuf, 65536, 64);
+        if ($n < 0) {
+            $e = $this->errno();
+            if ($e == 11 || $e == 4) { return ""; }
+            return null;
+        }
+        $this->m->poke8($this->rbuf + $n, 0);
+        if ($n > 0) { $this->scrubNul($n); }
+        return strstr($this->rbuf, "");
+    }
+    public func peerUid($fd) {
+        $b = $this->m->alloc(16);
+        $l = $this->m->alloc(8);
+        $this->m->poke32($l, 12);
+        $r = mem.i32(getsockopt($fd, 1, 17, $b, $l));
+        $uid = -1;
+        if ($r == 0) { $uid = $this->m->peek32($b + 4); }
+        $this->m->release($b); $this->m->release($l);
+        return $uid;
+    }
+
+    # ───────────── system plików ─────────────
+    # 0 brak, 1 plik, 2 katalog, 3 symlink, 4 inny
+    public func stat($path) {
+        if (mem.i32(lstat($path, $this->sbuf)) < 0) { return 0; }
+        $off = 16;
+        if ($this->isX86()) { $off = 24; }
+        $t = $this->m->peek32($this->sbuf + $off) & 61440;
+        if ($t == 32768) { return 1; }
+        if ($t == 16384) { return 2; }
+        if ($t == 40960) { return 3; }
+        return 4;
+    }
+    public func size($path) {
+        if (mem.i32(lstat($path, $this->sbuf)) < 0) { return -1; }
+        return $this->m->peek64($this->sbuf + 48);
+    }
+    public func mtime($path) {
+        if (mem.i32(lstat($path, $this->sbuf)) < 0) { return -1; }
+        return $this->m->peek64($this->sbuf + 88);
+    }
+    public func exists($path) { return $this->stat($path) != 0; }
+    public func isDir($path) {
+        $k = $this->stat($path);
+        if ($k == 2) { return true; }
+        if ($k == 3) { return $this->dirList($path) != null; }
+        return false;
+    }
+
+    public func mkdirp($path, $mode) {
+        $parts = split($path, "/");
+        $cur = "";
+        if (starts_with($path, "/")) { $cur = ""; }
+        foreach ($parts as $p) {
+            if ($p == "") { continue; }
+            $cur = $cur . "/" . $p;
+            if (mem.i32(mkdir($cur, $mode)) < 0 && $this->errno() != 17) { return $this->fail(); }
+        }
+        return 0;
+    }
+    public func symlink($target, $link) {
+        if (mem.i32(symlink($target, $link)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func readlink($path) {
+        $n = readlink($path, $this->rbuf, 4095);
+        if ($n < 0) { return null; }
+        $this->m->poke8($this->rbuf + $n, 0);
+        return strstr($this->rbuf, "");
+    }
+    public func unlink($path) {
+        if (mem.i32(unlink($path)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func rmdir($path) {
+        if (mem.i32(rmdir($path)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func rename($a, $b) {
+        if (mem.i32(rename($a, $b)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    # lista nazw w katalogu albo null
+    public func dirList($path) {
+        $d = opendir($path);
+        if ($d == 0) { return null; }
+        $out = [];
+        while (true) {
+            $e = readdir($d);
+            if ($e == 0) { break; }
+            $name = $this->m->cstr($e + 19);
+            if ($name != "." && $name != "..") { $out[] = $name; }
+        }
+        closedir($d);
+        return $out;
+    }
+    public func chown($path, $uid, $gid) {
+        if (mem.i32(chown($path, $uid, $gid)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func chmod($path, $mode) {
+        if (mem.i32(chmod($path, $mode)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func access($path, $mode) {
+        if (mem.i32(access($path, $mode)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func writeFile($path, $data, $create) {
+        $f = 1 | 524288;
+        if ($create) { $f = $f | 64 | 512; }
+        $fd = mem.i32(open($path, $f, 420));
+        if ($fd < 0) { return $this->fail(); }
+        $n = write($fd, $data, strlen($data));
+        $e = $this->errno();
+        close($fd);
+        if ($n < 0) { return 0 - $e; }
+        return $n;
+    }
+    public func appendFile($path, $data) {
+        $fd = mem.i32(open($path, 1 | 64 | 1024 | 524288, 420));
+        if ($fd < 0) { return $this->fail(); }
+        $n = write($fd, $data, strlen($data));
+        close($fd);
+        if ($n < 0) { return $this->fail(); }
+        return $n;
+    }
+    # cała zawartość (do max bajtów) albo null
+    public func readFile($path, $max) {
+        $fd = mem.i32(open($path, 524288, 0));
+        if ($fd < 0) { return null; }
+        $acc = "";
+        $total = 0;
+        while ($total < $max) {
+            $n = read($fd, $this->rbuf, 65536);
+            if ($n <= 0) { break; }
+            $this->m->poke8($this->rbuf + $n, 0);
+            $this->scrubNul($n);
+            $acc = $acc . strstr($this->rbuf, "");
+            $total += $n;
+        }
+        close($fd);
+        return $acc;
+    }
+
+    func mountFlags($names) {
+        $f = 0;
+        foreach (split($names, ",") as $t) {
+            if ($t == "ro") { $f = $f | 1; }
+            elseif ($t == "nosuid") { $f = $f | 2; }
+            elseif ($t == "nodev") { $f = $f | 4; }
+            elseif ($t == "noexec") { $f = $f | 8; }
+            elseif ($t == "sync") { $f = $f | 16; }
+            elseif ($t == "remount") { $f = $f | 32; }
+            elseif ($t == "noatime") { $f = $f | 1024; }
+            elseif ($t == "bind") { $f = $f | 4096; }
+            elseif ($t == "rec") { $f = $f | 16384; }
+            elseif ($t == "silent") { $f = $f | 32768; }
+            elseif ($t == "private") { $f = $f | 262144; }
+            elseif ($t == "slave") { $f = $f | 524288; }
+            elseif ($t == "shared") { $f = $f | 1048576; }
+            elseif ($t == "relatime") { $f = $f | 2097152; }
+            elseif ($t == "strictatime") { $f = $f | 16777216; }
+        }
+        return $f;
+    }
+    public func mount($src, $target, $fstype, $flags, $data) {
+        if (mem.i32(mount($src, $target, $fstype, $this->mountFlags($flags), $data)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func umount($target, $lazy) {
+        $f = 0;
+        if ($lazy) { $f = 2; }
+        if (mem.i32(umount2($target, $f)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func sync() { sync(); }
+
+    # ───────────── system, użytkownicy ─────────────
+    public func reboot($what) {
+        $cmd = 19088743;
+        if ($what == "poweroff") { $cmd = 1126301404; }
+        elseif ($what == "halt") { $cmd = 3454992675; }
+        elseif ($what == "kexec") { $cmd = 1163412803; }
+        sync();
+        if (mem.i32(reboot($cmd)) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func setHostname($name) {
+        if (mem.i32(sethostname($name, strlen($name))) < 0) { return $this->fail(); }
+        return 0;
+    }
+    public func hostname() {
+        $b = $this->m->alloc(260);
+        $r = mem.i32(gethostname($b, 255));
+        $s = null;
+        if ($r == 0) { $s = $this->m->cstr($b); }
+        $this->m->release($b);
+        return $s;
+    }
+    public func userUid($user) {
+        $p = getpwnam($user);
+        if ($p == 0) { return -1; }
+        return $this->m->peek32($p + 16);
+    }
+    public func userGid($user) {
+        $p = getpwnam($user);
+        if ($p == 0) { return -1; }
+        return $this->m->peek32($p + 20);
+    }
+    public func userHome($user) {
+        $p = getpwnam($user);
+        if ($p == 0) { return null; }
+        return $this->m->cstr($this->m->peek64($p + 32));
+    }
+    public func userShell($user) {
+        $p = getpwnam($user);
+        if ($p == 0) { return null; }
+        return $this->m->cstr($this->m->peek64($p + 40));
+    }
+    public func groupGid($group) {
+        $p = getgrnam($group);
+        if ($p == 0) { return -1; }
+        return $this->m->peek32($p + 16);
+    }
+    # /dev/console jako stdin/stdout/stderr (PID 1)
+    public func console() {
+        $fd = mem.i32(open("/dev/console", 2 | 256 | 524288, 0));
+        if ($fd < 0) { return $this->fail(); }
+        dup2($fd, 0); dup2($fd, 1); dup2($fd, 2);
+        if ($fd > 2) { close($fd); }
+        return 0;
+    }
+    public func kmsg($msg) {
+        $fd = mem.i32(open("/dev/kmsg", 1 | 256 | 524288, 0));
+        if ($fd < 0) { return $this->fail(); }
+        $line = "<6>zenitd: " . $msg . "\n";
+        write($fd, $line, strlen($line));
+        close($fd);
+        return 0;
+    }
+
+    # ───────────── uruchamianie procesów ─────────────
+    ##
+     * spec (tablica asocjacyjna): path, argv[], env[], uid, gid, user, groups[] (lub null), umask, nice, dir, root,
+     * limits[[NAZWA,miękki,twardy]], stdin/stdout/stderr ("inherit"|"null"|"fd:N"|"file:P"|"append:P"|"tty:P"),
+     * fds[], cgroup, sandbox[nnp,ptmp,pnet,psys,phome,ro[],rw[],na[]], bounding[ "~"? , CAP...], ambient[CAP...]
+     * Zwraca pid albo -errno (stage: spawnStage).
+     ##
+    public func spawn($spec) {
+        $argv = $this->m->strarray($spec["argv"]);
+        $envp = $this->m->strarray($spec["env"]);
+        $pp = $this->pipeBlocking();
+        if ($pp == null) { return $this->fail(); }
+        $pid = mem.i32(fork());
+        if ($pid < 0) {
+            $e = $this->fail();
+            close($pp[0]); close($pp[1]);
+            return $e;
+        }
+        if ($pid == 0) {
+            close($pp[0]);
+            $this->childMain($spec, $argv, $envp, $pp[1]);
+            _exit(127);
+        }
+        close($pp[1]);
+        $this->m->freearray($argv, count($spec["argv"]));
+        $this->m->freearray($envp, count($spec["env"]));
+        $b = $this->m->alloc(80);
+        $n = read($pp[0], $b, 79);
+        close($pp[0]);
+        if ($n > 0) {
+            $msg = $this->m->cstr($b);
+            $this->m->release($b);
+            $parts = split($msg, " ");
+            $this->spawnStage = $parts[0];
+            $st = $this->m->alloc(8);
+            waitpid($pid, $st, 0);
+            $this->m->release($st);
+            return 0 - intval($parts[1]);
+        }
+        $this->m->release($b);
+        $this->spawnStage = "";
+        return $pid;
+    }
+
+    func childFail($w, $stage) {
+        $e = $this->errno();
+        $msg = $stage . " " . strval($e);
+        write($w, $msg, strlen($msg));
+        _exit(127);
+    }
+
+    func childMain($spec, $argv, $envp, $w0) {
+        $m = $this->m;
+        $w = mem.i32(fcntl($w0, 1030, 300));
+        if ($w < 0) { $w = $w0; }
+        # maska sygnałów i obsługa domyślna
+        $empty = $m->alloc(256);
+        sigemptyset($empty);
+        sigprocmask(2, $empty, 0);
+        $s = 1;
+        while ($s < 32) { if ($s != 9 && $s != 19) { signal($s, 0); } $s += 1; }
+        setsid();
+
+        $cg = $spec["cgroup"] ?? "";
+        if ($cg != "") {
+            $fd = mem.i32(open($cg . "/cgroup.procs", 1 | 524288, 0));
+            if ($fd < 0) { $this->childFail($w, "cgroup"); }
+            $pidstr = strval(getpid());
+            if (write($fd, $pidstr, strlen($pidstr)) < 0) { $this->childFail($w, "cgroup"); }
+            close($fd);
+        }
+
+        # deskryptory 3.. i stdio
+        $fds = $spec["fds"] ?? [];
+        $tmp = [];
+        $k = 0;
+        foreach ($fds as $f) {
+            $d = mem.i32(fcntl($f, 0, 100 + $k));
+            if ($d < 0) { $this->childFail($w, "fds"); }
+            $tmp[] = $d;
+            $k += 1;
+        }
+        $io = [$spec["stdin"] ?? "inherit", $spec["stdout"] ?? "inherit", $spec["stderr"] ?? "inherit"];
+        $k = 0;
+        while ($k < 3) {
+            if (starts_with($io[$k], "fd:")) {
+                $sfd = mem.i32(fcntl(intval(substr($io[$k], 3, strlen($io[$k]) - 3)), 0, 200 + $k));
+                if ($sfd < 0) { $this->childFail($w, "stdio"); }
+                $io[$k] = "fd:" . strval($sfd);
+            }
+            $k += 1;
+        }
+        $k = 0;
+        while ($k < count($tmp)) {
+            if (mem.i32(dup2($tmp[$k], 3 + $k)) < 0) { $this->childFail($w, "fds"); }
+            close($tmp[$k]);
+            $k += 1;
+        }
+        $k = 0;
+        while ($k < 3) {
+            if ($this->childStdio($k, $io[$k]) < 0) { $this->childFail($w, "stdio"); }
+            $k += 1;
+        }
+        $k = 0;
+        while ($k < 3) {
+            if (starts_with($io[$k], "fd:")) { close(intval(substr($io[$k], 3, strlen($io[$k]) - 3))); }
+            $k += 1;
+        }
+
+        if (($spec["umask"] ?? null) != null) { umask($spec["umask"]); }
+        if (($spec["nice"] ?? null) != null) {
+            if (mem.i32(setpriority(0, 0, $spec["nice"])) < 0) { $this->childFail($w, "nice"); }
+        }
+        foreach (($spec["limits"] ?? []) as $l) {
+            $res = $this->rlimitResource($l[0]);
+            if ($res >= 0) {
+                $rl = $m->alloc(16);
+                $m->poke64($rl, $l[1]);
+                $m->poke64($rl + 8, $l[2]);
+                if (mem.i32(setrlimit($res, $rl)) < 0) { $this->childFail($w, "rlimit"); }
+            }
+        }
+        $b = $spec["bounding"] ?? null;
+        if ($b != null) { $this->capBounding($b); }
+
+        $sb = $spec["sandbox"] ?? null;
+        if ($sb != null) {
+            if ($this->childSandbox($sb) < 0) { $this->childFail($w, "sandbox"); }
+        }
+        $root = $spec["root"] ?? "";
+        if ($root != "") {
+            if (mem.i32(chroot($root)) < 0 || mem.i32(chdir("/")) < 0) { $this->childFail($w, "chroot"); }
+        }
+
+        $slot = $spec["listenPidSlot"] ?? -1;
+        if ($slot >= 0) {
+            $m->poke64($envp + $slot * 8, strdup("LISTEN_PID=" . strval(getpid())));
+        }
+        $amb = $spec["ambient"] ?? [];
+        $uid = $spec["uid"] ?? null;
+        if ($uid != null) {
+            $gid = $spec["gid"] ?? $uid;
+            $groups = $spec["groups"] ?? null;
+            if ($groups != null) {
+                $gl = $m->alloc(count($groups) * 4 + 8);
+                $i = 0;
+                while ($i < count($groups)) { $m->poke32($gl + $i * 4, $groups[$i]); $i += 1; }
+                if (mem.i32(setgroups(count($groups), $gl)) < 0) { $this->childFail($w, "groups"); }
+            } elseif (($spec["user"] ?? "") != "") {
+                if (mem.i32(initgroups($spec["user"], $gid)) < 0) { $this->childFail($w, "groups"); }
+            } else {
+                setgroups(0, 0);
+            }
+            if (count($amb) > 0) { prctl(8, 1, 0, 0, 0); }
+            if (mem.i32(setresgid($gid, $gid, $gid)) < 0) { $this->childFail($w, "setgid"); }
+            if (mem.i32(setresuid($uid, $uid, $uid)) < 0) { $this->childFail($w, "setuid"); }
+        }
+        if (count($amb) > 0) { $this->capAmbient($amb); }
+
+        $dir = $spec["dir"] ?? "";
+        if ($dir != "") {
+            if (mem.i32(chdir($dir)) < 0) { $this->childFail($w, "chdir"); }
+        }
+        execve($spec["path"], $argv, $envp);
+        $this->childFail($w, "exec");
+    }
+
+    func childStdio($idx, $spec) {
+        if ($spec == "inherit" || $spec == "") { return 0; }
+        $fd = -1;
+        if ($spec == "null") {
+            $fl = 1;
+            if ($idx == 0) { $fl = 0; }
+            $fd = mem.i32(open("/dev/null", $fl, 0));
+        } elseif (starts_with($spec, "fd:")) {
+            $src = intval(substr($spec, 3, strlen($spec) - 3));
+            if ($src == $idx) { fcntl($src, 2, 0); return 0; }
+            return mem.i32(dup2($src, $idx));
+        } elseif (starts_with($spec, "file:")) {
+            $p = substr($spec, 5, strlen($spec) - 5);
+            if ($idx == 0) { $fd = mem.i32(open($p, 0, 0)); } else { $fd = mem.i32(open($p, 1 | 64 | 512, 420)); }
+        } elseif (starts_with($spec, "append:")) {
+            $fd = mem.i32(open(substr($spec, 7, strlen($spec) - 7), 1 | 64 | 1024, 420));
+        } elseif (starts_with($spec, "tty:")) {
+            $fd = mem.i32(open(substr($spec, 4, strlen($spec) - 4), 2 | 256, 0));
+            if ($fd >= 0) { ioctl($fd, 21518, 0); }
+        }
+        if ($fd < 0) { return -1; }
+        if ($fd != $idx) {
+            if (mem.i32(dup2($fd, $idx)) < 0) { close($fd); return -1; }
+            close($fd);
+        }
+        return 0;
+    }
+
+    func rlimitResource($name) {
+        $names = ["CPU", "FSIZE", "DATA", "STACK", "CORE", "RSS", "NPROC", "NOFILE", "MEMLOCK", "AS"];
+        $i = 0;
+        while ($i < count($names)) {
+            if ($names[$i] == $name) { return $i; }
+            $i += 1;
+        }
+        return -1;
+    }
+
+    func capNum($name) {
+        $caps = ["CHOWN","DAC_OVERRIDE","DAC_READ_SEARCH","FOWNER","FSETID","KILL","SETGID","SETUID","SETPCAP","LINUX_IMMUTABLE","NET_BIND_SERVICE","NET_BROADCAST","NET_ADMIN","NET_RAW","IPC_LOCK","IPC_OWNER","SYS_MODULE","SYS_RAWIO","SYS_CHROOT","SYS_PTRACE","SYS_PACCT","SYS_ADMIN","SYS_BOOT","SYS_NICE","SYS_RESOURCE","SYS_TIME","SYS_TTY_CONFIG","MKNOD","LEASE","AUDIT_WRITE","AUDIT_CONTROL","SETFCAP","MAC_OVERRIDE","MAC_ADMIN","SYSLOG","WAKE_ALARM","BLOCK_SUSPEND","AUDIT_READ","PERFMON","BPF","CHECKPOINT_RESTORE"];
+        $n = upper($name);
+        if (starts_with($n, "CAP_")) { $n = substr($n, 4, strlen($n) - 4); }
+        $i = 0;
+        while ($i < count($caps)) {
+            if ($caps[$i] == $n) { return $i; }
+            $i += 1;
+        }
+        return -1;
+    }
+
+    # bounding: ["~", CAP...] (czarna lista) albo [CAP...] (biała lista)
+    func capBounding($list) {
+        $black = (count($list) > 0 && $list[0] == "~");
+        $mask = 0;
+        foreach ($list as $c) {
+            if ($c == "~") { continue; }
+            $n = $this->capNum($c);
+            if ($n >= 0) { $mask = $mask | (1 << $n); }
+        }
+        $c = 0;
+        while ($c < 41) {
+            $in = (($mask >> $c) & 1) == 1;
+            $drop = !$in;
+            if ($black) { $drop = $in; }
+            if ($drop) { prctl(24, $c, 0, 0, 0); }
+            $c += 1;
+        }
+    }
+
+    func capAmbient($list) {
+        $nrGet = 90; $nrSet = 91;
+        if ($this->isX86()) { $nrGet = 125; $nrSet = 126; }
+        $m = $this->m;
+        $hdr = $m->alloc(16);
+        $data = $m->alloc(32);
+        $m->poke32($hdr, 537396514);
+        if (syscall($nrGet, $hdr, $data, 0, 0) < 0) { return -1; }
+        foreach ($list as $c) {
+            $n = $this->capNum($c);
+            if ($n < 0) { continue; }
+            $slot = $data + intval($n / 32) * 12;
+            $bit = 1 << ($n % 32);
+            $m->poke32($slot, $m->peek32($slot) | $bit);
+            $m->poke32($slot + 4, $m->peek32($slot + 4) | $bit);
+            $m->poke32($slot + 8, $m->peek32($slot + 8) | $bit);
+        }
+        syscall($nrSet, $hdr, $data, 0, 0);
+        foreach ($list as $c) {
+            $n = $this->capNum($c);
+            if ($n >= 0) { prctl(47, 2, $n, 0, 0); }
+        }
+        return 0;
+    }
+
+    func mountRoBind($p, $ro) {
+        if (mem.i32(mount($p, $p, "", 4096 | 16384, "")) < 0) { return -1; }
+        $f = 4096 | 32 | 16384;
+        if ($ro) { $f = $f | 1; }
+        return mem.i32(mount("none", $p, "", $f, ""));
+    }
+
+    func loUp() {
+        $s = mem.i32(socket(2, 2 | 524288, 0));
+        if ($s < 0) { return; }
+        $r = $this->m->alloc(48);
+        $this->m->put($r, "lo");
+        if (mem.i32(ioctl($s, 35091, $r)) == 0) {
+            $this->m->poke16($r + 16, $this->m->peek16($r + 16) | 1);
+            ioctl($s, 35092, $r);
+        }
+        close($s);
+    }
+
+    func protectStrict() {
+        $txt = $this->readFile("/proc/self/mountinfo", 1048576);
+        if ($txt == null) { return; }
+        foreach (split($txt, "\n") as $line) {
+            $f = split($line, " ");
+            if (count($f) < 5) { continue; }
+            $mp = $f[4];
+            if (starts_with($mp, "/dev") || starts_with($mp, "/proc") || starts_with($mp, "/sys") || starts_with($mp, "/run")) { continue; }
+            mount("none", $mp, "", 4096 | 32 | 1, "");
+        }
+    }
+
+    func childSandbox($sb) {
+        $ptmp = $sb["ptmp"] ?? false;
+        $pnet = $sb["pnet"] ?? false;
+        $psys = $sb["psys"] ?? "";
+        $phome = $sb["phome"] ?? "";
+        $ro = $sb["ro"] ?? [];
+        $rw = $sb["rw"] ?? [];
+        $na = $sb["na"] ?? [];
+        $needNs = $ptmp || $psys != "" || $phome != "" || count($ro) > 0 || count($rw) > 0 || count($na) > 0;
+        if ($needNs || $pnet) {
+            $fl = 0;
+            if ($needNs) { $fl = $fl | 131072; }
+            if ($pnet) { $fl = $fl | 1073741824; }
+            if (mem.i32(unshare($fl)) < 0) { return -1; }
+            if ($pnet) { $this->loUp(); }
+            if ($needNs && mem.i32(mount("none", "/", "", 16384 | 262144, "")) < 0) { return -1; }
+        }
+        if ($ptmp) {
+            mount("tmpfs", "/tmp", "tmpfs", 6, "mode=1777");
+            mount("tmpfs", "/var/tmp", "tmpfs", 6, "mode=1777");
+        }
+        if ($phome != "") {
+            foreach (["/home", "/root", "/run/user"] as $h) {
+                if ($this->stat($h) == 0) { continue; }
+                if ($phome == "ro" || $phome == "read-only") { $this->mountRoBind($h, true); }
+                else { mount("tmpfs", $h, "tmpfs", 14, "mode=0755"); }
+            }
+        }
+        if ($psys == "strict") { $this->protectStrict(); }
+        elseif ($psys != "") {
+            $dirs = ["/usr", "/boot", "/efi"];
+            if ($psys == "full") { $dirs[] = "/etc"; }
+            foreach ($dirs as $d) { if ($this->stat($d) != 0) { $this->mountRoBind($d, true); } }
+        }
+        foreach ($ro as $p) { if ($this->stat($p) != 0) { $this->mountRoBind($p, true); } }
+        foreach ($rw as $p) { if ($this->stat($p) != 0) { $this->mountRoBind($p, false); } }
+        foreach ($na as $p) {
+            $k = $this->stat($p);
+            if ($k == 2) { mount("tmpfs", $p, "tmpfs", 1 | 2 | 4 | 8, "mode=000"); }
+            elseif ($k != 0) { mount("/dev/null", $p, "", 4096, ""); }
+        }
+        if (($sb["nnp"] ?? false) && mem.i32(prctl(38, 1, 0, 0, 0)) < 0) { return -1; }
+        return 0;
+    }
+}

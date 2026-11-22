@@ -1,0 +1,797 @@
+namespace manager;
+import Workspace.util;
+import Workspace.unit;
+import Workspace.loader;
+import Workspace.graph;
+import Workspace.runtime;
+import Workspace.service;
+import Workspace.socket;
+import Workspace.timer;
+import Workspace.journal;
+import Workspace.cgroup;
+import Workspace.config;
+import Workspace.control;
+
+class Job {
+    public $id = 0;
+    public $unit = "";
+    public $type = "start";        # start | stop | restart | reload
+    public $state = "waiting";     # waiting | running
+    public $phase = 0;             # restart: 0 = zatrzymywanie, 1 = start
+    public $sawActivating = false;
+    public $reason = "";
+    public $waiters = [];          # deskryptory połączeń czekających na wynik
+    public $createdMs = 0;
+    public $result = "";
+}
+
+class Manager {
+    public $sys;
+    public $cfg;
+    public $journal;
+    public $cg;
+    public $loader;
+    public $control;
+    public $runtimes = [];
+    public $order = [];             # nazwy runtime w kolejności tworzenia
+    public $pidmap = [];
+    public $fdmap = [];
+    public $jobs = [];
+    public $jobOrder = [];
+    public $jobSeq = 0;
+    public $epfd = -1;
+    public $sigfd = -1;
+    public $ctlFd = -1;
+    public $devlogFd = -1;
+    public $running = true;
+    public $shuttingDown = false;
+    public $shutdownKind = "";
+    public $shutdownStart = 0;
+    public $exitCode = 0;
+    public $bootMono = 0;
+    public $bootTarget = "";
+    public $bootDone = false;
+    public $dispatching = false;
+    public $redispatch = false;
+    public $environment = [];
+    public $failedBoot = [];
+    public $bootRealMs = 0;
+
+    public func __construct($sys, $cfg) {
+        $this->sys = $sys;
+        $this->cfg = $cfg;
+        $this->bootMono = $sys->monoMs();
+        $this->bootRealMs = $sys->realMs();
+        $host = $sys->hostname();
+        $ctx = ["user" => "root", "uid" => $cfg->uid, "home" => $cfg->home, "host" => $host ?? "localhost",
+                "runtime" => $cfg->runDirBase(), "state" => $cfg->stateBase(), "cache" => $cfg->cacheBase(),
+                "logs" => $cfg->logsBase(), "conf" => $cfg->confBase()];
+        $this->loader = new Loader($sys, $cfg->unitDirs, $cfg->enableDir, $ctx);
+        $this->control = new Control($this);
+    }
+
+    # ───────────── rejestr (interfejs dla graph) ─────────────
+
+    public func unit($name) { return $this->loader->load($name); }
+
+    public func loadedUnits() {
+        $out = [];
+        foreach ($this->order as $n) {
+            $rt = $this->runtimes[$n] ?? null;
+            if ($rt != null) { $out[] = $rt->unit; }
+        }
+        return $out;
+    }
+
+    public func runtimeFor($name) { return $this->runtimes[$name] ?? null; }
+
+    # mount/swap => syntetyczna usługa oneshot
+    func synthesize($u) {
+        if ($u->type == "mount") {
+            $what = $u->get("Mount", "What", "");
+            $where = $u->get("Mount", "Where", "");
+            $type = $u->get("Mount", "Type", "");
+            $opts = $u->get("Mount", "Options", "");
+            $cmd = "/bin/mount";
+            if ($type != "") { $cmd = $cmd . " -t " . $type; }
+            if ($opts != "") { $cmd = $cmd . " -o " . $opts; }
+            $cmd = $cmd . " " . $what . " " . $where;
+            $u->setValue("Service", "Type", "oneshot");
+            $u->setValue("Service", "RemainAfterExit", "yes");
+            $u->setValue("Service", "ExecStart", $cmd);
+            $u->setValue("Service", "ExecStop", "/bin/umount " . $where);
+        } elseif ($u->type == "swap") {
+            $what = $u->get("Swap", "What", "");
+            $u->setValue("Service", "Type", "oneshot");
+            $u->setValue("Service", "RemainAfterExit", "yes");
+            $u->setValue("Service", "ExecStart", "/sbin/swapon " . $what);
+            $u->setValue("Service", "ExecStop", "/sbin/swapoff " . $what);
+        }
+    }
+
+    # zwraca Runtime dla jednostki (tworzy przy pierwszym użyciu) albo null gdy nie da się załadować
+    public func ensureRuntime($name) {
+        $rt = $this->runtimes[$name] ?? null;
+        if ($rt != null) { return $rt; }
+        $u = $this->loader->load($name);
+        if ($u->loadError != "") { return null; }
+        if ($u->type == "mount" || $u->type == "swap") { $this->synthesize($u); }
+        if ($u->type == "service" || $u->type == "mount" || $u->type == "swap") { $rt = new Service($u); }
+        elseif ($u->type == "socket") { $rt = new Socket($u); }
+        elseif ($u->type == "timer") { $rt = new Timer($u); }
+        else { $rt = new Target($u); }
+        $this->runtimes[$name] = $rt;
+        $this->order[] = $name;
+        return $rt;
+    }
+
+    # ───────────── logowanie ─────────────
+
+    public func log($prio, $unitName, $msg) {
+        if ($this->journal == null) { return 0; }
+        return $this->journal->write($unitName, 1, $prio, "zenitd", "[" . $unitName . "] " . $msg);
+    }
+    public func info($msg) { if ($this->journal != null) { $this->journal->log(6, $msg); } }
+    public func warn($msg) { if ($this->journal != null) { $this->journal->log(4, $msg); } }
+    public func err($msg) { if ($this->journal != null) { $this->journal->log(3, $msg); } }
+
+    # ───────────── epoll / pidmap ─────────────
+
+    public func watch($fd, $kind, $name) {
+        $this->fdmap[$fd] = [$kind, $name];
+        $this->sys->epollCtl($this->epfd, 1, $fd, 1);
+    }
+    public func unwatch($fd) {
+        if (($this->fdmap[$fd] ?? null) == null) { return 0; }
+        $this->fdmap[$fd] = null;
+        $this->sys->epollCtl($this->epfd, 2, $fd, 0);
+        return 0;
+    }
+    public func addPid($pid, $name) { $this->pidmap[$pid] = $name; }
+    public func delPid($pid) { $this->pidmap[$pid] = null; }
+
+    public func notifyPathFor($name) { return $this->cfg->notifyDir . "/" . $name; }
+
+    # fd gniazd aktywnych .socket dla usługi: [[fd...], [nazwa...]]
+    public func socketFdsFor($svcName) {
+        $fds = [];
+        $names = [];
+        foreach ($this->order as $n) {
+            $rt = $this->runtimes[$n];
+            if ($rt->unit->type != "socket" || $rt->state != "active") { continue; }
+            if ($rt->serviceName() != $svcName) { continue; }
+            $i = 0;
+            foreach ($rt->fds as $fd) { $fds[] = $fd; $names[] = $rt->names[$i]; $i += 1; }
+        }
+        return [$fds, $names];
+    }
+
+    # ───────────── zadania ─────────────
+
+    func newJob($name, $type, $reason) {
+        $j = new Job();
+        $this->jobSeq += 1;
+        $j->id = $this->jobSeq;
+        $j->unit = $name;
+        $j->type = $type;
+        $j->reason = $reason;
+        $j->createdMs = $this->sys->monoMs();
+        $this->jobs[$name] = $j;
+        $this->jobOrder[] = $name;
+        return $j;
+    }
+
+    public func jobFor($name) { return $this->jobs[$name] ?? null; }
+    public func pendingJobsPublic() { return $this->pendingJobs(); }
+
+    func pendingJobs() {
+        $out = [];
+        foreach ($this->jobOrder as $n) {
+            $j = $this->jobs[$n] ?? null;
+            if ($j != null) { $out[] = $j; }
+        }
+        return $out;
+    }
+
+    func compactJobOrder() {
+        $keep = [];
+        foreach ($this->jobOrder as $n) { if (($this->jobs[$n] ?? null) != null) { $keep[] = $n; } }
+        $this->jobOrder = $keep;
+    }
+
+    # Dodaje zadanie dla jednostki; łączy z istniejącym. Zwraca Job albo null.
+    func addJob($name, $type, $reason) {
+        $ex = $this->jobs[$name] ?? null;
+        if ($ex != null) {
+            if ($ex->type == $type) { return $ex; }
+            if ($ex->type == "stop" && ($type == "start" || $type == "restart")) { $ex->type = "restart"; $ex->phase = 0; return $ex; }
+            if (($ex->type == "start" || $ex->type == "restart") && $type == "stop") {
+                $this->finishJob($ex, "canceled");
+                return $this->newJob($name, $type, $reason);
+            }
+            if ($ex->type == "start" && $type == "restart") { $ex->type = "restart"; return $ex; }
+            return $ex;
+        }
+        return $this->newJob($name, $type, $reason);
+    }
+
+    # Główne wejście: planuje i zleca zadania. Zwraca ["job" => Job|null, "errors" => [...], "warnings" => [...]]
+    public func submit($name, $type, $reason) {
+        $res = ["job" => null, "errors" => [], "warnings" => []];
+        $this->loader->clearCache();
+        $root = $this->ensureRuntime($name);
+        if ($root == null) {
+            $u = $this->loader->load($name);
+            $res["errors"][] = "Jednostka " . $name . " nie została znaleziona lub jest nieprawidłowa: " . $u->loadError;
+            return $res;
+        }
+        if ($this->shuttingDown && $type != "stop") {
+            $res["errors"][] = "System jest zamykany — start jednostek jest zablokowany";
+            return $res;
+        }
+        if ($type == "stop") {
+            $plan = graph.planStop($this, $name);
+            foreach ($plan["stop"] as $n) {
+                $rt = $this->runtimes[$n] ?? null;
+                if ($rt != null && ($rt->isRunning() || ($rt->state == "failed" && $n == $name))) { $this->addJob($n, "stop", $reason); }
+            }
+            $res["job"] = $this->jobs[$name] ?? null;
+            $this->runJobs();
+            return $res;
+        }
+        if ($type == "try-restart" || $type == "try-reload-or-restart") {
+            if (!$root->isRunning()) { return $res; }
+            $type = $type == "try-restart" ? "restart" : "reload-or-restart";
+        }
+        if ($type == "reload-or-restart") {
+            if ($root->isActive() && $root->unit->has("Service", "ExecReload")) { $type = "reload"; } else { $type = "restart"; }
+        }
+        if ($type == "reload") {
+            if (!$root->isActive()) { $res["errors"][] = "Jednostka " . $name . " nie jest aktywna — nie można przeładować"; return $res; }
+            $res["job"] = $this->addJob($name, "reload", $reason);
+            $this->runJobs();
+            return $res;
+        }
+        # start / restart
+        $plan = graph.planStart($this, $name);
+        foreach ($plan["errors"] as $e) { $res["errors"][] = $e; }
+        foreach ($plan["warnings"] as $w) { $res["warnings"][] = $w; $this->warn($w); }
+        if (count($res["errors"]) > 0) { return $res; }
+        foreach ($plan["stop"] as $n) {
+            $rt = $this->runtimes[$n] ?? null;
+            if ($rt != null && $rt->isRunning()) { $this->addJob($n, "stop", "konflikt z " . $name); }
+        }
+        foreach ($plan["start"] as $n) {
+            $rt = $this->ensureRuntime($n);
+            if ($rt == null) { continue; }
+            if ($n == $name && $type == "restart") { $this->addJob($n, "restart", $reason); continue; }
+            if ($rt->isActive() && $n != $name) { continue; }
+            if ($rt->isActive() && $n == $name) { $res["job"] = null; continue; }
+            if ($rt->isActivating() && $n == $name && ($this->jobs[$n] ?? null) == null) { continue; }
+            $this->addJob($n, "start", $n == $name ? $reason : "zależność " . $name);
+        }
+        $res["job"] = $this->jobs[$name] ?? null;
+        $this->runJobs();
+        return $res;
+    }
+
+    public func enqueueStart($name, $reason) {
+        $r = $this->submit($name, "start", $reason);
+        foreach ($r["errors"] as $e) { $this->err($e); }
+        return $r;
+    }
+
+    # Czy zadanie $j musi jeszcze poczekać na inne?
+    func blocked($j) {
+        $u = $this->runtimes[$j->unit]->unit;
+        foreach ($this->pendingJobs() as $k) {
+            if ($k->unit == $j->unit) { continue; }
+            $ku = $this->runtimes[$k->unit]->unit;
+            $kStopping = ($k->type == "stop" || ($k->type == "restart" && $k->phase == 0));
+            $jStopping = ($j->type == "stop" || ($j->type == "restart" && $j->phase == 0));
+            if (!$jStopping) {
+                if ($kStopping) {
+                    if (util.contains_item($u->conflicts, $k->unit) || util.contains_item($ku->conflicts, $j->unit)) { return true; }
+                } else {
+                    # k startuje wcześniej: j After k albo k Before j
+                    if (util.contains_item($u->after, $k->unit) || util.contains_item($ku->before, $j->unit)) { return true; }
+                }
+            } else {
+                if ($kStopping) {
+                    # k startowało po j (k After j) => k musi się zatrzymać pierwsze
+                    if (util.contains_item($ku->after, $j->unit) || util.contains_item($u->before, $k->unit)) { return true; }
+                }
+            }
+        }
+        return false;
+    }
+
+    public func runJobs() {
+        if ($this->dispatching) { $this->redispatch = true; return 0; }
+        $this->dispatching = true;
+        $guard = 0;
+        while ($guard < 1000) {
+            $guard += 1;
+            $this->redispatch = false;
+            $progress = false;
+            foreach ($this->pendingJobs() as $j) {
+                if (($this->jobs[$j->unit] ?? null) != $j) { continue; }
+                if ($j->state != "waiting") { continue; }
+                if ($this->blocked($j)) { continue; }
+                $this->execJob($j);
+                $progress = true;
+            }
+            $this->compactJobOrder();
+            if (!$progress && !$this->redispatch) { break; }
+        }
+        $this->dispatching = false;
+        return 0;
+    }
+
+    func depFailure($rt) {
+        $u = $rt->unit;
+        foreach (util.concat($u->requires, $u->bindsTo) as $d) {
+            $dr = $this->runtimes[$d] ?? null;
+            if ($dr != null && $dr->state == "failed") { return $d; }
+        }
+        foreach ($u->requisite as $d) {
+            $dr = $this->runtimes[$d] ?? null;
+            if ($dr == null || !$dr->isActive()) { return $d; }
+        }
+        return "";
+    }
+
+    func execJob($j) {
+        $rt = $this->runtimes[$j->unit];
+        $j->state = "running";
+        if ($j->type == "start" || ($j->type == "restart" && $j->phase == 1)) {
+            $bad = $this->depFailure($rt);
+            if ($bad != "") {
+                $this->log(3, $j->unit, "Zależność nie powiodła się: " . $bad);
+                $this->finishJob($j, "dependency");
+                return 0;
+            }
+            if ($rt->unit->getBool("Unit", "RefuseManualStart", false) && $j->reason == "manual") {
+                $this->finishJob($j, "refused");
+                return 0;
+            }
+            $rt->start($this);
+        } elseif ($j->type == "stop" || ($j->type == "restart" && $j->phase == 0)) {
+            $rt->stop($this);
+        } elseif ($j->type == "reload") {
+            $rt->reload($this);
+        }
+        $this->evaluate($j, $rt, "");
+        return 0;
+    }
+
+    # Czy stan jednostki kończy zadanie?
+    func evaluate($j, $rt, $old) {
+        if (($this->jobs[$j->unit] ?? null) != $j || $j->state != "running") { return 0; }
+        $st = $rt->state;
+        if ($st == "activating") { $j->sawActivating = true; }
+        $starting = ($j->type == "start" || ($j->type == "restart" && $j->phase == 1));
+        $stopping = ($j->type == "stop" || ($j->type == "restart" && $j->phase == 0));
+        if ($starting) {
+            if ($st == "active") { $this->finishJob($j, "done"); }
+            elseif ($st == "failed") { $this->finishJob($j, "failed"); }
+            elseif ($st == "inactive") {
+                if ($rt->sub == "condition-failed") { $this->finishJob($j, "skipped"); }
+                elseif ($old == "activating" || $j->sawActivating) { $this->finishJob($j, $rt->result == "success" ? "done" : "failed"); }
+            }
+        } elseif ($stopping) {
+            if ($st == "inactive" || $st == "failed") {
+                if ($j->type == "restart") {
+                    $j->phase = 1;
+                    $j->state = "waiting";
+                    $j->sawActivating = false;
+                    $this->redispatch = true;
+                } else { $this->finishJob($j, "done"); }
+            }
+        } elseif ($j->type == "reload") {
+            if ($st == "active" && $rt->sub != "reload") { $this->finishJob($j, "done"); }
+            elseif ($st != "active") { $this->finishJob($j, "failed"); }
+        }
+        return 0;
+    }
+
+    func finishJob($j, $result) {
+        if (($this->jobs[$j->unit] ?? null) != $j) { return 0; }
+        $j->result = $result;
+        $this->jobs[$j->unit] = null;
+        $this->control->jobFinished($j);
+        if ($result == "failed" || $result == "dependency") {
+            $this->failedBoot[] = $j->unit;
+            if ($j->unit == $this->bootTarget && !$this->bootDone) { $this->bootFailed(); }
+        }
+        if ($j->unit == $this->bootTarget && $result != "canceled") { $this->bootDone = true; $this->bootCompleted(); }
+        $this->redispatch = true;
+        if (!$this->dispatching) { $this->runJobs(); }
+        return 0;
+    }
+
+    # Callback z Runtime::setState
+    public func changed($rt, $old) {
+        $name = $rt->name();
+        if ($this->journal != null) {
+            $this->journal->write($name, 1, 7, "zenitd", "[" . $name . "] " . $old . " -> " . $rt->state . " (" . $rt->sub . ")");
+        }
+        $j = $this->jobs[$name] ?? null;
+        if ($j != null) { $this->evaluate($j, $rt, $old); }
+        if ($rt->state == "failed" && $old != "failed") {
+            $this->log(3, $name, "Jednostka zakończyła się niepowodzeniem (" . $rt->result . ")");
+            foreach ($rt->unit->onFailure as $f) { $this->enqueueStart($f, "OnFailure z " . $name); }
+            if (!$this->shuttingDown && $j == null) { $this->propagateFailure($rt); }
+        } elseif (($rt->state == "inactive") && $old == "active" && $j == null && !$this->shuttingDown) {
+            $this->propagateBinds($rt);
+        }
+        if ($rt->state == "inactive" || $rt->state == "failed" || $rt->state == "active") {
+            foreach ($this->order as $n) {
+                $o = $this->runtimes[$n];
+                if ($o->unit->type == "timer" && $o->serviceName() == $name) { $o->serviceStateChanged($this, $rt); }
+                if ($o->unit->type == "socket" && $o->serviceName() == $name && ($rt->state == "inactive" || $rt->state == "failed")) { $o->resume($this); }
+            }
+        }
+        $this->redispatch = true;
+        if (!$this->dispatching) { $this->runJobs(); }
+        return 0;
+    }
+
+    # usługa padła niespodziewanie: zatrzymaj jednostki, które jej Requires/BindsTo
+    func propagateFailure($rt) {
+        foreach ($this->order as $n) {
+            $o = $this->runtimes[$n];
+            if (!$o->isRunning()) { continue; }
+            if (util.contains_item($o->unit->requires, $rt->name()) || util.contains_item($o->unit->bindsTo, $rt->name())) {
+                $this->log(4, $n, "Zatrzymuję: zależność " . $rt->name() . " nie powiodła się");
+                $this->submit($n, "stop", "zależność padła");
+            }
+        }
+    }
+    func propagateBinds($rt) {
+        foreach ($this->order as $n) {
+            $o = $this->runtimes[$n];
+            if (!$o->isRunning()) { continue; }
+            if (util.contains_item($o->unit->bindsTo, $rt->name())) { $this->submit($n, "stop", "BindsTo " . $rt->name()); }
+        }
+    }
+
+    # ───────────── cel startowy ─────────────
+
+    func bootCompleted() {
+        $ms = $this->sys->monoMs() - $this->bootMono;
+        $this->info("Rozruch zakończony w " . util.fmtDuration($ms) . " (cel: " . $this->bootTarget . ")");
+        $this->sys->kmsg("boot finished in " . util.fmtDuration($ms));
+        return 0;
+    }
+
+    func bootFailed() {
+        $this->err("Cel startowy " . $this->bootTarget . " nie powiódł się — tryb awaryjny");
+        $em = $this->ensureRuntime("emergency.target");
+        if ($em != null && $this->bootTarget != "emergency.target") {
+            $this->bootTarget = "emergency.target";
+            $this->bootDone = false;
+            $this->submit("emergency.target", "start", "boot");
+        } else { $this->emergencyShell(); }
+        return 0;
+    }
+
+    public func emergencyShell() {
+        $spec = ["path" => "/bin/sh", "argv" => ["-sh"], "env" => ["PATH=" . "/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=linux"],
+                 "stdin" => "tty:/dev/console", "stdout" => "tty:/dev/console", "stderr" => "tty:/dev/console"];
+        $pid = $this->sys->spawn($spec);
+        if ($pid > 0) { $this->addPid($pid, "emergency-shell"); $this->info("Uruchomiono powłokę awaryjną (pid " . strval($pid) . ")"); }
+        else { $this->err("Nie można uruchomić powłoki awaryjnej: " . $this->sys->errstr($pid)); }
+        return 0;
+    }
+
+    # ───────────── przeładowanie ─────────────
+
+    public func reloadUnits() {
+        $this->loader->clearCache();
+        $n = 0;
+        foreach ($this->order as $name) {
+            $rt = $this->runtimes[$name];
+            $u = $this->loader->load($name);
+            if ($u->loadError == "") {
+                if ($u->type == "mount" || $u->type == "swap") { $this->synthesize($u); }
+                $rt->unit = $u;
+                $n += 1;
+            } elseif (!$rt->isRunning()) {
+                # jednostka zniknęła, a nie działa — zapomnij
+                $this->runtimes[$name] = null;
+            }
+        }
+        $keep = [];
+        foreach ($this->order as $name) { if (($this->runtimes[$name] ?? null) != null) { $keep[] = $name; } }
+        $this->order = $keep;
+        $this->info("Przeładowano konfigurację jednostek (" . strval($n) . " zmaterializowanych)");
+        return $n;
+    }
+
+    # ───────────── zdarzenia ─────────────
+
+    public func reapAll() {
+        $n = 0;
+        while ($n < 4096) {
+            $p = $this->sys->reap();
+            if ($p <= 0) { break; }
+            $n += 1;
+            $status = $this->sys->lastStatus;
+            $name = $this->pidmap[$p] ?? null;
+            if ($name == null) { continue; }
+            if ($name == "emergency-shell") {
+                $this->pidmap[$p] = null;
+                if ($this->bootTarget == "emergency.target" && !$this->shuttingDown) { $this->emergencyShell(); }
+                continue;
+            }
+            $rt = $this->runtimes[$name] ?? null;
+            if ($rt != null) { $rt->onExit($this, $p, $status); }
+        }
+        if ($n > 0) { $this->runJobs(); }
+        return $n;
+    }
+
+    func handleSignal($s) {
+        if ($s == 17) { $this->reapAll(); return 0; }
+        if ($s == 15) {
+            if ($this->cfg->isPid1) { $this->reloadUnits(); } else { $this->beginShutdown("exit"); }
+            return 0;
+        }
+        if ($s == 1) { $this->reloadUnits(); return 0; }
+        if ($s == 2) {
+            if ($this->cfg->isPid1) { $this->enqueueStart($this->cfg->ctrlAltDel, "Ctrl-Alt-Del"); } else { $this->beginShutdown("exit"); }
+            return 0;
+        }
+        if ($s == 30) { $this->beginShutdown("poweroff"); return 0; }
+        if ($s == 37) { $this->beginShutdown("halt"); return 0; }
+        if ($s == 38) { $this->beginShutdown("poweroff"); return 0; }
+        if ($s == 39) { $this->beginShutdown("reboot"); return 0; }
+        if ($s == 40) { $this->beginShutdown("kexec"); return 0; }
+        if ($s == 10) { $this->control->rebind(); return 0; }
+        if ($s == 12) { $this->dumpState(); return 0; }
+        return 0;
+    }
+
+    func dumpState() {
+        foreach ($this->order as $n) {
+            $rt = $this->runtimes[$n];
+            $this->info("stan: " . $n . " " . $rt->state . "/" . $rt->sub);
+        }
+        foreach ($this->pendingJobs() as $j) { $this->info("zadanie #" . strval($j->id) . " " . $j->type . " " . $j->unit . " [" . $j->state . "]"); }
+        return 0;
+    }
+
+    func handleEvent($fd, $flags) {
+        $m = $this->fdmap[$fd] ?? null;
+        if ($m == null) { return 0; }
+        $kind = $m[0];
+        if ($kind == "signal") {
+            $n = 0;
+            while ($n < 64) {
+                $s = $this->sys->signalRead($fd);
+                if ($s <= 0) { break; }
+                $this->handleSignal($s);
+                $n += 1;
+            }
+        } elseif ($kind == "control") { $this->control->acceptNew($fd); }
+        elseif ($kind == "conn") { $this->control->onConn($fd, $flags); }
+        elseif ($kind == "devlog") { $this->readDevlog($fd); }
+        else {
+            $rt = $this->runtimes[$m[1]] ?? null;
+            if ($rt != null) { $rt->onFd($this, $fd, $flags, $kind); }
+        }
+        return 0;
+    }
+
+    func readDevlog($fd) {
+        $n = 0;
+        while ($n < 256) {
+            $d = $this->sys->recv($fd);
+            if ($d == null || $d == "") { break; }
+            $e = journal.parseSyslog($d);
+            $this->journal->write("syslog", $e["pid"], $e["prio"], $e["ident"], $e["msg"]);
+            $n += 1;
+        }
+        return 0;
+    }
+
+    func computeTimeout() {
+        $now = $this->sys->monoMs();
+        $best = 5000;
+        foreach ($this->order as $n) {
+            $w = $this->runtimes[$n]->nextWake();
+            if ($w >= 0) {
+                $d = $w - $now;
+                if ($d < 0) { $d = 0; }
+                if ($d < $best) { $best = $d; }
+            }
+        }
+        if ($this->shuttingDown && $best > 200) { $best = 200; }
+        return $best;
+    }
+
+    func tickAll() {
+        $now = $this->sys->monoMs();
+        foreach ($this->order as $n) {
+            $rt = $this->runtimes[$n] ?? null;
+            if ($rt == null) { continue; }
+            $w = $rt->nextWake();
+            if ($w >= 0 && $w <= $now) { $rt->onTick($this, $now); }
+        }
+        return 0;
+    }
+
+    # jedna iteracja pętli — wydzielona dla testów
+    public func iterate($timeoutMs) {
+        $evs = $this->sys->epollWait($this->epfd, $timeoutMs);
+        foreach ($evs as $e) { $this->handleEvent($e[0], $e[1]); }
+        $this->tickAll();
+        $this->reapAll();
+        $this->runJobs();
+        $this->shutdownProgress();
+        return 0;
+    }
+
+    public func loop() {
+        while ($this->running) {
+            try {
+                $this->iterate($this->computeTimeout());
+            } catch (Throwable $e) {
+                # PID 1 nie może paść: zapisz błąd i kontynuuj
+                $this->err("Wyjątek w pętli głównej: " . $e->getMessage());
+                $this->sys->sleepMs(50);
+            }
+        }
+        return $this->exitCode;
+    }
+
+    # ───────────── uruchomienie menedżera ─────────────
+
+    public func setup() {
+        $sys = $this->sys;
+        $cfg = $this->cfg;
+        $sys->ignoreSigpipe();
+        $sys->mkdirp($cfg->runDir, 493);
+        $sys->mkdirp($cfg->notifyDir, 493);
+        $sys->mkdirp($cfg->stateDir, 493);
+        $dirs = [$cfg->volatileLogDir];
+        if ($sys->exists($cfg->persistLogDir) || $cfg->isPid1) { $dirs[] = $cfg->persistLogDir; }
+        $this->journal = new Journal($sys, $dirs, $cfg->logMaxBytes, $cfg->logKeep);
+        $this->journal->minPrio = $cfg->logLevel;
+        $this->journal->write("zenitd", 1, 6, "zenit-boot", "-- zenitd " . "0.1.0" . " start --");
+        $this->epfd = $sys->epollCreate();
+        $sigs = [1, 2, 10, 12, 15, 17, 28, 30, 37, 38, 39, 40];
+        $this->sigfd = $sys->signalfd($sigs);
+        if ($this->sigfd >= 0) { $this->watch($this->sigfd, "signal", ""); }
+        if (!$cfg->isPid1) { $sys->subreaper(); }
+        $this->cg = new Cgroup($sys, $cfg->cgroupBase);
+        $slice = "zenit.slice";
+        if ($cfg->mode == "user") { $slice = "zenit-user.slice"; }
+        if ($this->cg->init($slice, $cfg->isPid1)) { $this->info("cgroup v2: " . $this->cg->root); }
+        else { $this->warn("cgroup v2 niedostępne — używam grup procesów"); }
+        $this->control->bind();
+        if ($cfg->mode == "system") {
+            $fd = $sys->bindDgram($cfg->devlogSock, 438);
+            if ($fd >= 0) {
+                $this->devlogFd = $fd;
+                $this->watch($fd, "devlog", "");
+                if ($cfg->isPid1 || !$sys->exists("/dev/log")) {
+                    $sys->unlink("/dev/log");
+                    $sys->symlink($cfg->devlogSock, "/dev/log");
+                }
+            }
+            if ($cfg->compatSdBooted) { $sys->mkdirp("/run/systemd/system", 493); }
+        }
+        return 0;
+    }
+
+    public func startBoot($target) {
+        $this->bootTarget = $target;
+        $this->info("Cel startowy: " . $target);
+        $r = $this->submit($target, "start", "boot");
+        foreach ($r["errors"] as $e) { $this->err($e); }
+        if (count($r["errors"]) > 0) { $this->bootFailed(); }
+        return 0;
+    }
+
+    # ───────────── zamykanie ─────────────
+
+    public func beginShutdown($kind) {
+        if ($this->shuttingDown) { return 0; }
+        $this->shuttingDown = true;
+        $this->shutdownKind = $kind;
+        $this->shutdownStart = $this->sys->monoMs();
+        $this->info("Zamykanie systemu: " . $kind);
+        $this->control->cancelAll();
+        foreach ($this->order as $n) {
+            $rt = $this->runtimes[$n];
+            if ($rt->isRunning() || $rt->state == "failed") {
+                if ($rt->isRunning()) { $this->addJob($n, "stop", "zamknięcie systemu"); }
+            }
+        }
+        $this->runJobs();
+        return 0;
+    }
+
+    public func anyRunningPublic() { return $this->anyRunning(); }
+
+    func anyRunning() {
+        foreach ($this->order as $n) {
+            $rt = $this->runtimes[$n];
+            if ($rt->isRunning()) { return true; }
+        }
+        return false;
+    }
+
+    public func shutdownProgress() {
+        if (!$this->shuttingDown) { return 0; }
+        $elapsed = $this->sys->monoMs() - $this->shutdownStart;
+        $idle = !$this->anyRunning() && count($this->pendingJobs()) == 0;
+        if ($idle || $elapsed > $this->cfg->shutdownTimeoutMs) {
+            if (!$idle) { $this->err("Przekroczono limit zamykania — wymuszam"); }
+            $this->finishShutdown();
+        }
+        return 0;
+    }
+
+    func finishShutdown() {
+        $sys = $this->sys;
+        $cfg = $this->cfg;
+        $kind = $this->shutdownKind;
+        $this->info("Zatrzymano wszystkie jednostki, kończę procesy resztkowe");
+        if ($cfg->isPid1 && !$cfg->container) {
+            $sys->kill(-1, 15);
+            $this->waitChildren(3000);
+            $sys->kill(-1, 9);
+            $this->waitChildren(1500);
+        }
+        $this->control->closeAll();
+        if ($this->journal != null) { $this->journal->write("zenitd", 1, 6, "zenit-boot", "-- zenitd stop (" . $kind . ") --"); }
+        $sys->sync();
+        $this->running = false;
+        if ($cfg->isPid1 && !$cfg->container) {
+            $this->unmountAll();
+            $sys->sync();
+            $r = $sys->reboot($kind == "exit" ? "poweroff" : $kind);
+            if ($r < 0) { $this->err("reboot(2) nie powiodło się: " . $sys->errstr($r)); }
+            # jeśli jądro wróciło, czekamy (nie wolno wyjść z PID 1)
+            $this->running = true;
+            $this->shuttingDown = false;
+            return 0;
+        }
+        $this->exitCode = 0;
+        if ($kind == "reboot") { $this->exitCode = 2; }
+        return 0;
+    }
+
+    func waitChildren($ms) {
+        $deadline = $this->sys->monoMs() + $ms;
+        while ($this->sys->monoMs() < $deadline) {
+            $p = $this->sys->reap();
+            if ($p == -1) { break; }
+            if ($p == 0) { $this->sys->sleepMs(50); }
+        }
+        return 0;
+    }
+
+    func unmountAll() {
+        $sys = $this->sys;
+        $t = $sys->readFile("/proc/self/mountinfo", 1048576);
+        if ($t == null) { return 0; }
+        $points = [];
+        foreach (split($t, "\n") as $l) {
+            $f = split($l, " ");
+            if (count($f) > 4) { $points[] = replace($f[4], "\\040", " "); }
+        }
+        $i = count($points) - 1;
+        while ($i >= 0) {
+            $p = $points[$i];
+            $i -= 1;
+            if ($p == "/" || $p == "/proc" || $p == "/sys" || $p == "/dev" || $p == "/run" || starts_with($p, "/sys/") || starts_with($p, "/proc/") || starts_with($p, "/dev/") || starts_with($p, "/run/")) { continue; }
+            $sys->umount($p, false);
+        }
+        $sys->mount("none", "/", "", "remount,ro", "");
+        return 0;
+    }
+}

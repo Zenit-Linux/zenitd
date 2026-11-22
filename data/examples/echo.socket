@@ -1,0 +1,9 @@
+[Unit]
+Description=Gniazdo echo
+
+[Socket]
+ListenStream=/run/echo.sock
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

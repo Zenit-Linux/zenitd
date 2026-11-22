@@ -1,0 +1,499 @@
+namespace control;
+import Workspace.util;
+import Workspace.proto;
+import Workspace.graph;
+
+class Control {
+    public $mgr;
+    public $conns = [];        # fd => ["buf" => ReqBuf, "uid" => int, "wait" => null|tablica]
+    public $listenFd = -1;
+
+    public func __construct($mgr) { $this->mgr = $mgr; }
+
+    public func bind() {
+        $cfg = $this->mgr->cfg;
+        $mode = 438;
+        if ($cfg->mode == "user") { $mode = 384; }
+        $fd = $this->mgr->sys->listenUnix($cfg->controlSock, $mode, 64);
+        if ($fd < 0) {
+            $this->mgr->err("Nie można utworzyć gniazda sterującego " . $cfg->controlSock . ": " . $this->mgr->sys->errstr($fd));
+            return -1;
+        }
+        $this->listenFd = $fd;
+        $this->mgr->watch($fd, "control", "");
+        return 0;
+    }
+
+    public func rebind() {
+        if ($this->listenFd >= 0) {
+            $this->mgr->unwatch($this->listenFd);
+            $this->mgr->sys->close($this->listenFd);
+            $this->listenFd = -1;
+        }
+        return $this->bind();
+    }
+
+    public func acceptNew($fd) {
+        $n = 0;
+        while ($n < 32) {
+            $c = $this->mgr->sys->accept($fd);
+            if ($c < 0) { break; }
+            $this->conns[$c] = ["buf" => new ReqBuf(), "uid" => $this->mgr->sys->peerUid($c), "wait" => null];
+            $this->mgr->watch($c, "conn", "");
+            $n += 1;
+        }
+        return 0;
+    }
+
+    func closeConn($fd) {
+        if (($this->conns[$fd] ?? null) == null) { return 0; }
+        $this->conns[$fd] = null;
+        $this->mgr->unwatch($fd);
+        $this->mgr->sys->close($fd);
+        return 0;
+    }
+
+    public func closeAll() {
+        foreach (keys($this->conns) as $fd) { $this->closeConn($fd); }
+        if ($this->listenFd >= 0) {
+            $this->mgr->unwatch($this->listenFd);
+            $this->mgr->sys->close($this->listenFd);
+            $this->mgr->sys->unlink($this->mgr->cfg->controlSock);
+            $this->listenFd = -1;
+        }
+        return 0;
+    }
+
+    # w trakcie zamykania: kończy oczekujące połączenia (zadania zostaną anulowane)
+    public func cancelAll() { return 0; }
+
+    public func onConn($fd, $flags) {
+        $c = $this->conns[$fd] ?? null;
+        if ($c == null) { return 0; }
+        $got = false;
+        $n = 0;
+        while ($n < 16) {
+            $d = $this->mgr->sys->read($fd, 65536);
+            if ($d == null) { $this->closeConn($fd); return 0; }
+            if ($d == "") { break; }
+            $got = true;
+            $lines = $c["buf"]->feed($d);
+            foreach ($lines as $line) {
+                $r = $this->handle($fd, proto.decodeRequest($line));
+                if ($r != null) { $this->reply($fd, $r[0], $r[1]); }
+            }
+            if ($c["buf"]->overflow) { $this->closeConn($fd); return 0; }
+            $n += 1;
+        }
+        if (!$got && ($flags & 4) != 0) { $this->closeConn($fd); }
+        return 0;
+    }
+
+    func reply($fd, $code, $body) {
+        if (($this->conns[$fd] ?? null) == null) { return 0; }
+        $this->mgr->sys->writeAll($fd, proto.encodeResponse($code, $body), 2000);
+        return 0;
+    }
+
+    # ───────────── uprawnienia ─────────────
+
+    func readOnly($cmd) {
+        return util.contains_item(["ping", "version", "list-units", "list-jobs", "status", "show", "is-active", "is-failed", "list-dependencies",
+                                   "list-timers", "list-sockets", "blame", "show-environment", "get-default", "dump", "uptime", "list-failed"], $cmd);
+    }
+
+    func allowed($fd, $cmd) {
+        if ($this->readOnly($cmd)) { return true; }
+        $uid = $this->conns[$fd]["uid"];
+        return $uid == 0 || $uid == $this->mgr->sys->uid();
+    }
+
+    # ───────────── obsługa poleceń ─────────────
+    # Zwraca [kod, treść] albo null (odpowiedź odroczona do zakończenia zadań).
+
+    public func handle($fd, $args) {
+        if (count($args) == 0) { return [1, "puste polecenie\n"]; }
+        $cmd = $args[0];
+        $flags = [];
+        $pos = [];
+        $i = 0;
+        foreach ($args as $a) {
+            if ($i > 0) {
+                if (starts_with($a, "--") || (starts_with($a, "-") && strlen($a) == 2)) { $flags[] = $a; } else { $pos[] = $a; }
+            }
+            $i += 1;
+        }
+        if (!$this->allowed($fd, $cmd)) { return [4, "Brak uprawnień: to polecenie wymaga roota\n"]; }
+        $mgr = $this->mgr;
+        if ($cmd == "ping") { return [0, "pong\n"]; }
+        if ($cmd == "version") { return [0, "zenitd 0.1.0\n"]; }
+        if ($cmd == "start" || $cmd == "stop" || $cmd == "restart" || $cmd == "reload" || $cmd == "try-restart" || $cmd == "reload-or-restart" || $cmd == "condrestart" || $cmd == "try-reload-or-restart") {
+            return $this->cmdJobs($fd, $cmd, $pos, $flags);
+        }
+        if ($cmd == "isolate") { return $this->cmdIsolate($fd, $pos, $flags); }
+        if ($cmd == "list-units") { return $this->cmdListUnits($pos, $flags); }
+        if ($cmd == "list-failed") { return $this->cmdListUnits($pos, ["--failed"]); }
+        if ($cmd == "list-jobs") { return $this->cmdListJobs(); }
+        if ($cmd == "status" || $cmd == "show") { return $this->cmdShow($pos); }
+        if ($cmd == "is-active") { return $this->cmdIsActive($pos, false); }
+        if ($cmd == "is-failed") { return $this->cmdIsActive($pos, true); }
+        if ($cmd == "kill") { return $this->cmdKill($pos, $flags); }
+        if ($cmd == "reset-failed") { return $this->cmdResetFailed($pos); }
+        if ($cmd == "daemon-reload" || $cmd == "daemon-reexec") {
+            $n = $mgr->reloadUnits();
+            return [0, ""];
+        }
+        if ($cmd == "poweroff" || $cmd == "reboot" || $cmd == "halt" || $cmd == "kexec" || $cmd == "exit") {
+            $mgr->beginShutdown($cmd);
+            return [0, ""];
+        }
+        if ($cmd == "list-timers") { return $this->cmdListTimers(); }
+        if ($cmd == "list-sockets") { return $this->cmdListSockets(); }
+        if ($cmd == "list-dependencies") { return $this->cmdDeps($pos, $flags); }
+        if ($cmd == "blame" || $cmd == "uptime") { return $this->cmdBlame(); }
+        if ($cmd == "show-environment") { return [0, join($mgr->cfg->defaultEnv, "\n") . "\n"]; }
+        if ($cmd == "set-environment") {
+            foreach ($pos as $kv) { $mgr->cfg->defaultEnv[] = $kv; }
+            return [0, ""];
+        }
+        if ($cmd == "unset-environment") {
+            $keep = [];
+            foreach ($mgr->cfg->defaultEnv as $kv) {
+                $drop = false;
+                foreach ($pos as $k) { if (starts_with($kv, $k . "=")) { $drop = true; } }
+                if (!$drop) { $keep[] = $kv; }
+            }
+            $mgr->cfg->defaultEnv = $keep;
+            return [0, ""];
+        }
+        if ($cmd == "get-default") { return [0, $mgr->loader->defaultTarget() . "\n"]; }
+        if ($cmd == "dump") { return $this->cmdDump(); }
+        return [1, "Nieznane polecenie: " . $cmd . "\n"];
+    }
+
+    # ── start/stop/... ──
+
+    func cmdJobs($fd, $cmd, $pos, $flags) {
+        $mgr = $this->mgr;
+        if (count($pos) == 0) { return [1, "Podaj nazwę jednostki\n"]; }
+        $type = $cmd;
+        if ($cmd == "condrestart") { $type = "try-restart"; }
+        $noBlock = util.contains_item($flags, "--no-block");
+        $errors = [];
+        $jobs = [];
+        foreach ($pos as $n) {
+            $name = util.normalizeName($n);
+            $r = $mgr->submit($name, $type, "manual");
+            foreach ($r["errors"] as $e) { $errors[] = $e; }
+            if ($r["job"] != null) { $jobs[] = $r["job"]; }
+        }
+        if (count($errors) > 0 && count($jobs) == 0) { return [1, join($errors, "\n") . "\n"]; }
+        if ($noBlock || count($jobs) == 0) {
+            if (count($errors) > 0) { return [1, join($errors, "\n") . "\n"]; }
+            return [0, ""];
+        }
+        $ids = [];
+        foreach ($jobs as $j) { $ids[] = $j->id; $j->waiters[] = $fd; }
+        $this->conns[$fd]["wait"] = ["ids" => $ids, "failed" => [], "errors" => $errors];
+        return null;
+    }
+
+    public func jobFinished($j) {
+        foreach ($j->waiters as $fd) {
+            $c = $this->conns[$fd] ?? null;
+            if ($c == null) { continue; }
+            $w = $c["wait"];
+            if ($w == null) { continue; }
+            $left = [];
+            foreach ($w["ids"] as $id) { if ($id != $j->id) { $left[] = $id; } }
+            $w["ids"] = $left;
+            if ($j->result == "failed" || $j->result == "dependency" || $j->result == "timeout" || $j->result == "canceled" || $j->result == "refused") {
+                $w["failed"][] = [$j->unit, $j->result];
+            }
+            $this->conns[$fd]["wait"] = $w;
+            if (count($left) == 0) {
+                $this->conns[$fd]["wait"] = null;
+                $this->finishWait($fd, $w);
+            }
+        }
+        return 0;
+    }
+
+    func finishWait($fd, $w) {
+        if (count($w["failed"]) == 0 && count($w["errors"]) == 0) { $this->reply($fd, 0, ""); return 0; }
+        $msg = "";
+        foreach ($w["failed"] as $f) {
+            $why = "zadanie się nie powiodło";
+            if ($f[1] == "dependency") { $why = "zależność nie powiodła się"; }
+            elseif ($f[1] == "timeout") { $why = "przekroczono limit czasu"; }
+            elseif ($f[1] == "canceled") { $why = "zadanie zostało anulowane"; }
+            elseif ($f[1] == "refused") { $why = "ręczne uruchomienie jest zabronione (RefuseManualStart)"; }
+            $msg = $msg . "Zadanie dla " . $f[0] . " nie powiodło się: " . $why . ".\nSzczegóły: zenitctl status " . $f[0] . "  oraz  journalctl -u " . $f[0] . "\n";
+        }
+        foreach ($w["errors"] as $e) { $msg = $msg . $e . "\n"; }
+        $this->reply($fd, 1, $msg);
+        return 0;
+    }
+
+    func cmdIsolate($fd, $pos, $flags) {
+        $mgr = $this->mgr;
+        if (count($pos) != 1) { return [1, "isolate wymaga dokładnie jednego celu\n"]; }
+        $name = util.normalizeName($pos[0]);
+        $rt = $mgr->ensureRuntime($name);
+        if ($rt == null) { return [1, "Nie znaleziono jednostki " . $name . "\n"]; }
+        if (!$rt->unit->getBool("Unit", "AllowIsolate", false)) { return [1, "Jednostka " . $name . " nie ma AllowIsolate=yes\n"]; }
+        $plan = graph.planStart($mgr, $name);
+        if (count($plan["errors"]) > 0) { return [1, join($plan["errors"], "\n") . "\n"]; }
+        foreach ($mgr->order as $n) {
+            $o = $mgr->runtimes[$n];
+            if (util.contains_item($plan["start"], $n)) { continue; }
+            if ($o->unit->getBool("Unit", "IgnoreOnIsolate", false)) { continue; }
+            if ($o->isRunning()) { $mgr->submit($n, "stop", "isolate " . $name); }
+        }
+        return $this->cmdJobs($fd, "start", [$name], $flags);
+    }
+
+    # ── listy ──
+
+    func loadStateOf($rt, $u) {
+        if ($u->masked) { return "masked"; }
+        if ($u->loadError == "not-found") { return "not-found"; }
+        if ($u->loadError != "") { return "error"; }
+        return "loaded";
+    }
+
+    func cmdListUnits($pos, $flags) {
+        $mgr = $this->mgr;
+        $all = util.contains_item($flags, "--all") || util.contains_item($flags, "-a");
+        $failedOnly = util.contains_item($flags, "--failed");
+        $types = [];
+        $states = [];
+        foreach ($flags as $f) {
+            if (starts_with($f, "--type=")) { $types = util.splitList(replace(substr($f, 7, strlen($f) - 7), ",", " ")); }
+            if (starts_with($f, "--state=")) { $states = util.splitList(replace(substr($f, 8, strlen($f) - 8), ",", " ")); }
+        }
+        $rows = [];
+        $seen = [];
+        if ($all) {
+            foreach ($mgr->loader->listFiles() as $uf) { $mgr->ensureRuntime($uf[0]); }
+        }
+        $names = sort($mgr->order);
+        foreach ($names as $n) {
+            $rt = $mgr->runtimes[$n];
+            $u = $rt->unit;
+            if ($failedOnly && $rt->state != "failed") { continue; }
+            if (!$all && !$failedOnly && $rt->state == "inactive" && ($mgr->jobs[$n] ?? null) == null) { continue; }
+            if (count($types) > 0 && !util.contains_item($types, $u->type)) { continue; }
+            if (count($states) > 0 && !util.contains_item($states, $rt->state) && !util.contains_item($states, $rt->sub)) { continue; }
+            $rows[] = join([$n, $this->loadStateOf($rt, $u), $rt->state, $rt->sub, $u->description, $rt->result], "\t");
+        }
+        return [0, join($rows, "\n") . (count($rows) > 0 ? "\n" : "")];
+    }
+
+    func cmdListJobs() {
+        $rows = [];
+        foreach ($this->mgr->pendingJobsPublic() as $j) {
+            $rows[] = join([strval($j->id), $j->unit, $j->type, $j->state], "\t");
+        }
+        return [0, join($rows, "\n") . (count($rows) > 0 ? "\n" : "")];
+    }
+
+    func cmdListTimers() {
+        $mgr = $this->mgr;
+        $rows = [];
+        foreach ($mgr->order as $n) {
+            $rt = $mgr->runtimes[$n];
+            if ($rt->unit->type != "timer") { continue; }
+            $d = $rt->describe($mgr);
+            $rows[] = join([$n, $rt->state == "active" ? strval($d["nextReal"]) : "0", strval($d["last"] * 1000), $d["service"]], "\t");
+        }
+        return [0, join($rows, "\n") . (count($rows) > 0 ? "\n" : "")];
+    }
+
+    func cmdListSockets() {
+        $mgr = $this->mgr;
+        $rows = [];
+        foreach ($mgr->order as $n) {
+            $rt = $mgr->runtimes[$n];
+            if ($rt->unit->type != "socket") { continue; }
+            $d = $rt->describe($mgr);
+            foreach ($d["listen"] as $l) { $rows[] = join([$l[0], $n, $d["service"], $l[1], $rt->state], "\t"); }
+        }
+        return [0, join($rows, "\n") . (count($rows) > 0 ? "\n" : "")];
+    }
+
+    func cmdBlame() {
+        $mgr = $this->mgr;
+        $rows = [];
+        $rows[] = "#uptime\t" . strval($mgr->sys->monoMs() - $mgr->bootMono);
+        foreach ($mgr->order as $n) {
+            $rt = $mgr->runtimes[$n];
+            if ($rt->activationMs >= 0) { $rows[] = strval($rt->activationMs) . "\t" . $n; }
+        }
+        return [0, join($rows, "\n") . "\n"];
+    }
+
+    func cmdDeps($pos, $flags) {
+        $mgr = $this->mgr;
+        $root = "default.target";
+        if (count($pos) > 0) { $root = util.normalizeName($pos[0]); }
+        if (count($pos) == 0) { $root = $mgr->loader->defaultTarget(); }
+        $mgr->ensureRuntime($root);
+        $rows = [];
+        if (util.contains_item($flags, "--reverse")) {
+            $mgr->ensureRuntime($root);
+            foreach ($mgr->order as $n) {
+                $u = $mgr->runtimes[$n]->unit;
+                if (util.contains_item($u->requires, $root) || util.contains_item($u->wants, $root) || util.contains_item($u->bindsTo, $root)) {
+                    $rt = $mgr->runtimes[$n];
+                    $rows[] = "1\t" . $n . "\t" . $rt->state;
+                }
+            }
+            return [0, "0\t" . $root . "\t" . $mgr->runtimes[$root]->state . "\n" . join($rows, "\n") . (count($rows) > 0 ? "\n" : "")];
+        }
+        $tree = graph.tree($mgr, $root, 8);
+        foreach ($tree as $t) {
+            $rt = $mgr->ensureRuntime($t[1]);
+            $st = $rt == null ? "not-found" : $rt->state;
+            $rows[] = strval($t[0]) . "\t" . $t[1] . "\t" . $st;
+        }
+        return [0, join($rows, "\n") . "\n"];
+    }
+
+    # ── status / show ──
+
+    func cmdIsActive($pos, $failed) {
+        $mgr = $this->mgr;
+        $out = [];
+        $ok = true;
+        foreach ($pos as $n) {
+            $name = util.normalizeName($n);
+            $rt = $mgr->runtimeFor($name);
+            if ($rt == null) { $rt = $mgr->ensureRuntime($name); }
+            $st = $rt == null ? "inactive" : $rt->state;
+            if ($rt != null && $rt->state == "activating" && $rt->sub == "auto-restart") { $st = "activating"; }
+            $out[] = $st;
+            if ($failed) { if ($st == "failed") { $ok = false; } }
+            else { if ($st != "active") { $ok = false; } }
+        }
+        $code = 0;
+        if ($failed) { if ($ok) { $code = 1; } } else { if (!$ok) { $code = 3; } }
+        return [$code, join($out, "\n") . "\n"];
+    }
+
+    func joinSp($l) { return join($l, " "); }
+
+    func cmdShow($pos) {
+        $mgr = $this->mgr;
+        if (count($pos) == 0) { return [1, "Podaj nazwę jednostki\n"]; }
+        $name = util.normalizeName($pos[0]);
+        $u = $mgr->loader->load($name);
+        $rt = $mgr->ensureRuntime($name);
+        $p = [];
+        $p[] = ["Id", $name];
+        $p[] = ["Description", $u->description];
+        $load = "loaded";
+        if ($u->masked) { $load = "masked"; } elseif ($u->loadError != "") { $load = "not-found"; }
+        $p[] = ["LoadState", $load];
+        $p[] = ["FragmentPath", $u->path];
+        $p[] = ["DropInPaths", $this->joinSp($u->dropins)];
+        $p[] = ["UnitFileState", $mgr->loader->enableState($name)];
+        if ($rt == null) {
+            $p[] = ["ActiveState", "inactive"];
+            $p[] = ["SubState", "dead"];
+            $p[] = ["LoadError", $u->loadError];
+        } else {
+            $p[] = ["ActiveState", $rt->state];
+            $p[] = ["SubState", $rt->sub];
+            $p[] = ["Result", $rt->result];
+            $p[] = ["ActiveEnterTimestamp", strval($rt->activeEnterReal)];
+            $p[] = ["InactiveEnterTimestamp", strval($rt->inactiveEnterReal)];
+            $d = $rt->describe($mgr);
+            foreach (keys($d) as $k) {
+                $v = $d[$k];
+                if ($k == "mainPid") { $p[] = ["MainPID", strval($v)]; }
+                elseif ($k == "controlPid") { $p[] = ["ControlPID", strval($v)]; }
+                elseif ($k == "status") { $p[] = ["StatusText", strval($v)]; }
+                elseif ($k == "restarts") { $p[] = ["NRestarts", strval($v)]; }
+                elseif ($k == "cgroup") { $p[] = ["ControlGroup", strval($v)]; }
+                elseif ($k == "tasks") { $p[] = ["TasksCurrent", strval($v)]; }
+                elseif ($k == "memory") { $p[] = ["MemoryCurrent", strval($v)]; }
+                elseif ($k == "failMsg") { $p[] = ["FailureMessage", strval($v)]; }
+                elseif ($k == "conditionMsg") { $p[] = ["ConditionFailed", strval($v)]; }
+                elseif ($k == "service") { $p[] = ["Triggers", strval($v)]; }
+                elseif ($k == "nextReal") { $p[] = ["NextElapse", strval($v)]; }
+                elseif ($k == "listen") {
+                    foreach ($v as $l) { $p[] = ["Listen", $l[0] . " (" . $l[1] . ")"]; }
+                }
+            }
+            if ($rt->unit->type == "service" || $rt->unit->type == "mount" || $rt->unit->type == "swap") {
+                $p[] = ["Type", $rt->svcType()];
+                $p[] = ["Restart", $u->get("Service", "Restart", "no")];
+                foreach ($u->getAll("Service", "ExecStart") as $e) { $p[] = ["ExecStart", $e]; }
+                $p[] = ["CanReload", $u->has("Service", "ExecReload") ? "yes" : "no"];
+                if ($rt->cgPath != "") {
+                    foreach ($mgr->cg->pids($rt->cgPath) as $pid) {
+                        $cl = $mgr->sys->readFile("/proc/" . strval($pid) . "/cmdline", 1024);
+                        $p[] = ["Process", strval($pid) . " " . trim($cl ?? "")];
+                    }
+                }
+            }
+        }
+        $p[] = ["Requires", $this->joinSp($u->requires)];
+        $p[] = ["Wants", $this->joinSp($u->wants)];
+        $p[] = ["BindsTo", $this->joinSp($u->bindsTo)];
+        $p[] = ["Conflicts", $this->joinSp($u->conflicts)];
+        $p[] = ["After", $this->joinSp($u->after)];
+        $p[] = ["Before", $this->joinSp($u->before)];
+        $p[] = ["WantedBy", $this->joinSp($u->wantedBy)];
+        foreach ($u->warnings as $w) { $p[] = ["Warning", $w]; }
+        $lines = [];
+        foreach ($p as $kv) { $lines[] = $kv[0] . "=" . util.escapeField($kv[1]); }
+        return [0, join($lines, "\n") . "\n"];
+    }
+
+    func cmdKill($pos, $flags) {
+        $mgr = $this->mgr;
+        $sig = 15;
+        $whom = "all";
+        foreach ($flags as $f) {
+            if (starts_with($f, "--signal=")) { $sig = util.sigNum(substr($f, 9, strlen($f) - 9)); }
+            if (starts_with($f, "--kill-whom=")) { $whom = substr($f, 12, strlen($f) - 12); }
+        }
+        if (count($pos) == 0) { return [1, "Podaj nazwę jednostki\n"]; }
+        $name = util.normalizeName($pos[0]);
+        $rt = $mgr->runtimeFor($name);
+        if ($rt == null || !$rt->isRunning()) { return [1, "Jednostka " . $name . " nie jest aktywna\n"]; }
+        $pid = $rt->mainPidValue();
+        if ($whom == "main" || $whom == "main-fail") {
+            if ($pid > 0) { $mgr->sys->kill($pid, $sig); }
+        } else {
+            if ($rt->cgPath != "") { $mgr->cg->kill($rt->cgPath, $sig); }
+            elseif ($pid > 0) { $mgr->sys->kill(0 - $pid, $sig); }
+        }
+        return [0, ""];
+    }
+
+    func cmdResetFailed($pos) {
+        $mgr = $this->mgr;
+        if (count($pos) == 0) {
+            foreach ($mgr->order as $n) { $mgr->runtimes[$n]->resetFailed($mgr); }
+            return [0, ""];
+        }
+        foreach ($pos as $n) {
+            $rt = $mgr->runtimeFor(util.normalizeName($n));
+            if ($rt != null) { $rt->resetFailed($mgr); if ($rt->unit->type == "service") { $rt->startTimes = []; $rt->restarts = 0; } }
+        }
+        return [0, ""];
+    }
+
+    func cmdDump() {
+        $mgr = $this->mgr;
+        $rows = [];
+        foreach ($mgr->order as $n) {
+            $rt = $mgr->runtimes[$n];
+            $rows[] = $n . " " . $rt->state . "/" . $rt->sub . " pid=" . strval($rt->mainPidValue());
+        }
+        return [0, join($rows, "\n") . "\n"];
+    }
+}

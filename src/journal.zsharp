@@ -1,0 +1,188 @@
+namespace journal;
+import Workspace.util;
+
+class Journal {
+    public $sys;
+    public $dirs = [];          # katalogi zapisu (ulotny, opcjonalnie trwały)
+    public $maxBytes = 16777216;
+    public $keep = 4;
+    public $sizes = [];         # katalog => bieżący rozmiar
+    public $partial = [];       # klucz (fd) => niedokończona linia
+    public $console = false;    # kopiuj na konsolę (stderr)
+    public $minPrio = 7;
+
+    public func __construct($sys, $dirs, $maxBytes, $keep) {
+        $this->sys = $sys;
+        $this->maxBytes = $maxBytes;
+        $this->keep = $keep;
+        foreach ($dirs as $d) {
+            $r = $sys->mkdirp($d, 493);
+            if ($r >= 0) {
+                $this->dirs[] = $d;
+                $sz = $sys->size($d . "/zenit.log");
+                if ($sz < 0) { $sz = 0; }
+                $this->sizes[$d] = $sz;
+            }
+        }
+    }
+
+    public func write($unit, $pid, $prio, $ident, $msg) {
+        if ($prio > $this->minPrio) { return 0; }
+        $ts = $this->sys->realMs();
+        $line = strval($ts) . "\t" . $unit . "\t" . strval($pid) . "\t" . strval($prio) . "\t" . util.escapeField($ident) . "\t" . util.escapeField($msg) . "\n";
+        $n = strlen($line);
+        foreach ($this->dirs as $d) {
+            $path = $d . "/zenit.log";
+            if (($this->sizes[$d] ?? 0) + $n > $this->maxBytes) { $this->rotate($d); }
+            $this->sys->appendFile($path, $line);
+            $this->sizes[$d] = ($this->sizes[$d] ?? 0) + $n;
+        }
+        if ($this->console && $prio <= 4) { $this->sys->write(2, $ident . ": " . $msg . "\n"); }
+        return $n;
+    }
+
+    func rotate($d) {
+        $i = $this->keep;
+        while ($i >= 1) {
+            $from = $d . "/zenit.log";
+            if ($i > 1) { $from = $d . "/zenit.log." . strval($i - 1); }
+            if ($this->sys->exists($from)) { $this->sys->rename($from, $d . "/zenit.log." . strval($i)); }
+            $i -= 1;
+        }
+        $this->sizes[$d] = 0;
+    }
+
+    # Dane z potoku usługi: dzieli na linie, zachowuje niedokończoną resztę pod kluczem $key
+    public func feed($key, $data, $unit, $pid, $prio, $ident) {
+        $buf = ($this->partial[$key] ?? "") . $data;
+        $parts = split($buf, "\n");
+        $n = count($parts);
+        $i = 0;
+        while ($i < $n - 1) {
+            $this->emitLine($parts[$i], $unit, $pid, $prio, $ident);
+            $i += 1;
+        }
+        $rest = $parts[$n - 1];
+        if (strlen($rest) > 16384) {
+            $this->emitLine($rest, $unit, $pid, $prio, $ident);
+            $rest = "";
+        }
+        $this->partial[$key] = $rest;
+    }
+
+    func emitLine($line, $unit, $pid, $prio, $ident) {
+        if (ends_with($line, "\r")) { $line = substr($line, 0, strlen($line) - 1); }
+        if ($line == "") { return 0; }
+        $this->write($unit, $pid, $prio, $ident, $line);
+        return 0;
+    }
+
+    # wymusza zapis niedokończonej linii (po zamknięciu potoku)
+    public func flush($key, $unit, $pid, $prio, $ident) {
+        $rest = $this->partial[$key] ?? "";
+        if ($rest != "") { $this->emitLine($rest, $unit, $pid, $prio, $ident); }
+        $this->partial[$key] = "";
+    }
+
+    # komunikat menedżera
+    public func log($prio, $msg) { return $this->write("zenitd", 1, $prio, "zenitd", $msg); }
+}
+
+# ───────────── syslog z /dev/log ─────────────
+
+# "<PRI>[Mmm dd hh:mm:ss ]tag[pid]: msg" => ["prio","facility","ident","pid","msg"]
+func parseSyslog($d) {
+    $d = trim($d);
+    $prio = 6;
+    $fac = 1;
+    if (starts_with($d, "<")) {
+        $e = index_of($d, ">");
+        if ($e > 0) {
+            $p = util.parseInt(substr($d, 1, $e - 1), 14);
+            $prio = $p % 8;
+            $fac = intval($p / 8);
+            $d = substr($d, $e + 1, strlen($d) - $e - 1);
+        }
+    }
+    # znacznik czasu RFC3164 "Nov 21 13:45:07 "
+    if (strlen($d) > 16 && substr($d, 3, 1) == " " && substr($d, 6, 1) == " " && substr($d, 9, 1) == ":" && substr($d, 12, 1) == ":") {
+        $d = substr($d, 16, strlen($d) - 16);
+    }
+    $ident = "syslog";
+    $pid = 0;
+    $msg = $d;
+    $colon = index_of($d, ": ");
+    if ($colon > 0 && $colon < 64 && !contains(substr($d, 0, $colon), " ")) {
+        $tag = substr($d, 0, $colon);
+        $msg = substr($d, $colon + 2, strlen($d) - $colon - 2);
+        $br = index_of($tag, "[");
+        if ($br > 0 && ends_with($tag, "]")) {
+            $pid = util.parseInt(substr($tag, $br + 1, strlen($tag) - $br - 2), 0);
+            $tag = substr($tag, 0, $br);
+        }
+        $ident = $tag;
+    }
+    return ["prio" => $prio, "facility" => $fac, "ident" => $ident, "pid" => $pid, "msg" => $msg];
+}
+
+# ───────────── odczyt ─────────────
+
+# wpisy w kolejności chronologicznej z katalogu (do $maxFiles plików); każdy wpis: [ts, unit, pid, prio, ident, msg]
+func readEntries($sys, $dir, $maxFiles) {
+    $files = [];
+    $i = $maxFiles;
+    while ($i >= 1) { $files[] = $dir . "/zenit.log." . strval($i); $i -= 1; }
+    $files[] = $dir . "/zenit.log";
+    $out = [];
+    foreach ($files as $f) {
+        $text = $sys->readFile($f, 268435456);
+        if ($text == null) { continue; }
+        foreach (split($text, "\n") as $line) {
+            if ($line == "") { continue; }
+            $p = split($line, "\t");
+            if (count($p) < 6) { continue; }
+            $out[] = [intval($p[0]), $p[1], intval($p[2]), intval($p[3]), util.unescapeField($p[4]), util.unescapeField($p[5])];
+        }
+    }
+    return $out;
+}
+
+# filtry: unit ("" = wszystkie), maxPrio (7 = wszystkie), sinceMs, grep ("" = brak)
+func filter($entries, $unit, $maxPrio, $sinceMs, $grep) {
+    $out = [];
+    foreach ($entries as $e) {
+        if ($unit != "" && $e[1] != $unit && $e[4] != util.unitStem($unit)) { continue; }
+        if ($e[3] > $maxPrio) { continue; }
+        if ($e[0] < $sinceMs) { continue; }
+        if ($grep != "" && !contains($e[5], $grep)) { continue; }
+        $out[] = $e;
+    }
+    return $out;
+}
+
+# ostatnie $n wpisów
+func tail($entries, $n) {
+    $c = count($entries);
+    if ($n < 0 || $c <= $n) { return $entries; }
+    return array_slice($entries, $c - $n, $n);
+}
+
+# czas rozruchu = znacznik ostatniego wpisu BOOT
+func lastBootMs($entries) {
+    $t = 0;
+    foreach ($entries as $e) { if ($e[4] == "zenit-boot") { $t = $e[0]; } }
+    return $t;
+}
+
+func monthName($m) {
+    $n = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return $n[$m - 1];
+}
+
+# "Nov 21 13:45:07 host ident[pid]: msg"
+func fmtShort($e, $sys, $host) {
+    $f = $sys->tm(intval($e[0] / 1000));
+    $who = $e[4];
+    if ($e[2] > 0 && $e[4] != "zenitd") { $who = $who . "[" . strval($e[2]) . "]"; }
+    return monthName($f[1]) . " " . pad_left(strval($f[2]), 2, " ") . " " . util.twoDigits($f[3]) . ":" . util.twoDigits($f[4]) . ":" . util.twoDigits($f[5]) . " " . $host . " " . $who . ": " . $e[5];
+}

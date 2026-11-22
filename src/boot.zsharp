@@ -1,0 +1,92 @@
+namespace boot;
+import Workspace.util;
+import Workspace.config;
+
+class Boot {
+    public $sys;
+    public $cfg;
+    public $notes = [];
+
+    public func __construct($sys, $cfg) {
+        $this->sys = $sys;
+        $this->cfg = $cfg;
+    }
+
+    func note($m) { $this->notes[] = $m; }
+
+    # montuje, jeśli jeszcze nie jest zamontowane (EBUSY = już jest)
+    func mountIf($src, $target, $fs, $flags, $data) {
+        $this->sys->mkdirp($target, 493);
+        $r = $this->sys->mount($src, $target, $fs, $flags, $data);
+        if ($r < 0 && $r != -16) { $this->note("mount " . $target . " (" . $fs . "): " . $this->sys->errstr($r)); }
+        return $r;
+    }
+
+    public func mountApi() {
+        $this->mountIf("proc", "/proc", "proc", "nosuid,nodev,noexec,relatime", "");
+        $this->mountIf("sysfs", "/sys", "sysfs", "nosuid,nodev,noexec,relatime", "");
+        $r = $this->mountIf("devtmpfs", "/dev", "devtmpfs", "nosuid", "mode=0755");
+        if ($r < 0 && $r != -16) { $this->mountIf("tmpfs", "/dev", "tmpfs", "nosuid", "mode=0755"); }
+        $this->mountIf("devpts", "/dev/pts", "devpts", "nosuid,noexec", "gid=5,mode=0620,ptmxmode=0666");
+        $this->mountIf("tmpfs", "/dev/shm", "tmpfs", "nosuid,nodev", "mode=1777");
+        $this->mountIf("tmpfs", "/run", "tmpfs", "nosuid,nodev", "mode=0755");
+        $this->mountIf("cgroup2", "/sys/fs/cgroup", "cgroup2", "nosuid,nodev,noexec,relatime", "nsdelegate");
+        return 0;
+    }
+
+    func devLinks() {
+        $links = [["/proc/self/fd", "/dev/fd"], ["/proc/self/fd/0", "/dev/stdin"], ["/proc/self/fd/1", "/dev/stdout"],
+                  ["/proc/self/fd/2", "/dev/stderr"], ["pts/ptmx", "/dev/ptmx"], ["/proc/kcore", "/dev/core"]];
+        foreach ($links as $l) {
+            if ($this->sys->stat($l[1]) == 0) { $this->sys->symlink($l[0], $l[1]); }
+        }
+        return 0;
+    }
+
+    func hostname() {
+        $t = $this->sys->readFile("/etc/hostname", 256);
+        if ($t == null) { return 0; }
+        $h = trim($t);
+        if ($h == "" || starts_with($h, "#")) { return 0; }
+        $r = $this->sys->setHostname($h);
+        if ($r < 0) { $this->note("sethostname: " . $this->sys->errstr($r)); }
+        return 0;
+    }
+
+    func machineId() {
+        $cur = $this->sys->readFile("/etc/machine-id", 64);
+        if ($cur != null && strlen(trim($cur)) == 32) { return 0; }
+        $u = $this->sys->readFile("/proc/sys/kernel/random/uuid", 64);
+        if ($u == null) { return 0; }
+        $id = replace(trim($u), "-", "");
+        $r = $this->sys->writeFile("/etc/machine-id", $id . "\n", true);
+        if ($r < 0) { $this->note("machine-id: " . $this->sys->errstr($r)); }
+        return 0;
+    }
+
+    public func run() {
+        $cfg = $this->cfg;
+        if ($cfg->mode == "system" && !$cfg->container) {
+            $this->mountApi();
+            $this->sys->console();
+            $this->devLinks();
+            $this->hostname();
+            $this->machineId();
+        }
+        $this->sys->mkdirp("/run/lock", 1023);
+        $this->sys->mkdirp($cfg->runDir, 493);
+        $cl = $this->sys->readFile("/proc/cmdline", 4096);
+        if ($cl != null) { $cfg->kernelCmdline = trim($cl); }
+        $fallback = $cfg->defaultTarget;
+        if ($fallback == "") { $fallback = "";}
+        return 0;
+    }
+
+    # cel startowy: parametr jądra > zenit.conf > default.target > multi-user.target
+    public func chooseTarget($loaderDefault) {
+        $base = $this->cfg->defaultTarget;
+        if ($base == "") { $base = $loaderDefault; }
+        $t = config.targetFromCmdline($this->cfg->kernelCmdline, $base);
+        return $t;
+    }
+}

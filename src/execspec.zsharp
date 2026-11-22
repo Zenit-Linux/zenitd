@@ -1,0 +1,309 @@
+namespace execspec;
+import Workspace.util;
+
+func defaultPath() { return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; }
+
+# plik środowiska: linie KLUCZ=WARTOŚĆ, # komentarze, cudzysłowy
+func parseEnvFile($text) {
+    $out = [];
+    foreach (split($text, "\n") as $l) {
+        $t = trim($l);
+        if ($t == "" || starts_with($t, "#") || starts_with($t, ";")) { continue; }
+        $eq = index_of($t, "=");
+        if ($eq <= 0) { continue; }
+        $k = trim(substr($t, 0, $eq));
+        $v = trim(substr($t, $eq + 1, strlen($t) - $eq - 1));
+        if (strlen($v) >= 2 && (substr($v, 0, 1) == "\"" || substr($v, 0, 1) == "'") && substr($v, strlen($v) - 1, 1) == substr($v, 0, 1)) {
+            $v = substr($v, 1, strlen($v) - 2);
+        }
+        $out[$k] = $v;
+    }
+    return $out;
+}
+
+# Environment= : wiele przypisań na linię, cudzysłowy
+func parseEnvironmentLine($line) {
+    $out = [];
+    foreach (util.splitWords($line) as $w) {
+        $eq = index_of($w, "=");
+        if ($eq > 0) { $out[substr($w, 0, $eq)] = substr($w, $eq + 1, strlen($w) - $eq - 1); }
+    }
+    return $out;
+}
+
+func resolvePath($sys, $path, $envPath) {
+    if (starts_with($path, "/")) { return $path; }
+    foreach (split($envPath, ":") as $d) {
+        if ($d == "") { continue; }
+        $p = util.joinPath($d, $path);
+        if ($sys->exists($p)) { return $p; }
+    }
+    return $path;
+}
+
+func limitValue($raw, $isSize) {
+    $parts = split($raw, ":");
+    $out = [];
+    foreach ($parts as $p) {
+        $p = trim($p);
+        if ($p == "infinity" || $p == "inf") { $out[] = "inf"; continue; }
+        $n = null;
+        if ($isSize) { $n = util.parseSize($p); } else { $n = util.parseInt($p, -1); if ($n < 0) { $n = null; } }
+        if ($n == null) { return null; }
+        $out[] = strval($n);
+    }
+    if (count($out) == 1) { return [$out[0], $out[0]]; }
+    return [$out[0], $out[1]];
+}
+
+func resolveUid($sys, $s) {
+    $n = util.parseInt($s, -1);
+    if ($n >= 0 && is_digit(substr($s, 0, 1))) { return $n; }
+    return $sys->userUid($s);
+}
+
+func resolveGid($sys, $s) {
+    $n = util.parseInt($s, -1);
+    if ($n >= 0 && is_digit(substr($s, 0, 1))) { return $n; }
+    return $sys->groupGid($s);
+}
+
+# Główna funkcja. $x: ["cgroup"=>str, "outFd"=>int(-1), "notifySock"=>str, "fds"=>[int], "fdNames"=>[str],
+#                       "extraEnv"=>[k=>v], "isMain"=>bool]
+# Zwraca ["spec"=>tablica, "error"=>"" , "ignored"=>[dyrektywy]] — przy błędzie spec = null.
+func build($sys, $cfg, $u, $cmd, $x) {
+    $env = [];
+    $ignored = [];
+    $env["PATH"] = defaultPath();
+    foreach ($cfg->defaultEnv as $kv) {
+        $eq = index_of($kv, "=");
+        if ($eq > 0) { $env[substr($kv, 0, $eq)] = substr($kv, $eq + 1, strlen($kv) - $eq - 1); }
+    }
+
+    # użytkownik / grupa
+    $uid = null;
+    $gid = null;
+    $userName = $u->get("Service", "User", "");
+    $home = $cfg->home;
+    $groups = null;
+    if ($cfg->uid == 0 && $cfg->mode == "system") {
+        if ($userName != "") {
+            $uid = resolveUid($sys, $userName);
+            if ($uid < 0) { return ["spec" => null, "error" => "użytkownik '" . $userName . "' nie istnieje (status 217/USER)", "ignored" => $ignored]; }
+            $gid = $sys->userGid($userName);
+            if ($gid < 0 || is_digit(substr($userName, 0, 1))) { $gid = $uid; }
+            $h = $sys->userHome($userName);
+            if ($h != null) { $home = $h; }
+            $env["HOME"] = $home;
+            $env["USER"] = $userName;
+            $env["LOGNAME"] = $userName;
+            $sh = $sys->userShell($userName);
+            if ($sh != null) { $env["SHELL"] = $sh; }
+        }
+        $g = $u->get("Service", "Group", "");
+        if ($g != "") {
+            $gid = resolveGid($sys, $g);
+            if ($gid < 0) { return ["spec" => null, "error" => "grupa '" . $g . "' nie istnieje (status 216/GROUP)", "ignored" => $ignored]; }
+            if ($uid == null) { $uid = 0; }
+        }
+        $sg = $u->getList("Service", "SupplementaryGroups");
+        if (count($sg) > 0) {
+            $groups = [];
+            foreach ($sg as $gn) {
+                $gg = resolveGid($sys, $gn);
+                if ($gg >= 0) { $groups[] = $gg; }
+            }
+            if ($gid != null) { $groups[] = $gid; }
+        }
+    } elseif ($userName != "") {
+        $ignored[] = "User= (brak uprawnień roota)";
+    }
+
+    # środowisko
+    foreach ($u->getAll("Service", "Environment") as $line) {
+        $m = parseEnvironmentLine($line);
+        foreach (keys($m) as $k) { $env[$k] = $m[$k]; }
+    }
+    foreach ($u->getAll("Service", "EnvironmentFile") as $ef) {
+        $opt = false;
+        if (starts_with($ef, "-")) { $opt = true; $ef = substr($ef, 1, strlen($ef) - 1); }
+        $t = $sys->readFile($ef, 1048576);
+        if ($t == null) {
+            if (!$opt) { return ["spec" => null, "error" => "nie można odczytać EnvironmentFile " . $ef . " (status 205/EXEC)", "ignored" => $ignored]; }
+            continue;
+        }
+        $m = parseEnvFile($t);
+        foreach (keys($m) as $k) { $env[$k] = $m[$k]; }
+    }
+    foreach ($u->getList("Service", "PassEnvironment") as $pn) {
+        $v = System.env($pn);
+        if ($v != null) { $env[$pn] = $v; }
+    }
+    $extra = $x["extraEnv"] ?? [];
+    foreach (keys($extra) as $k) { $env[$k] = $extra[$k]; }
+    if (($x["notifySock"] ?? "") != "") { $env["NOTIFY_SOCKET"] = $x["notifySock"]; }
+    $fds = $x["fds"] ?? [];
+    $slot = -1;
+    if (count($fds) > 0) {
+        $env["LISTEN_FDS"] = strval(count($fds));
+        $env["LISTEN_PID"] = "0";
+        $names = $x["fdNames"] ?? [];
+        if (count($names) > 0) { $env["LISTEN_FDNAMES"] = join($names, ":"); }
+    }
+    $envList = [];
+    $i = 0;
+    foreach (keys($env) as $k) {
+        if ($k == "LISTEN_PID") { $slot = $i; }
+        $envList[] = $k . "=" . $env[$k];
+        $i += 1;
+    }
+
+    # ścieżka i argv
+    $path = resolvePath($sys, $cmd["path"], $env["PATH"]);
+    $argv = $cmd["argv"];
+    if (count($argv) == 0) { return ["spec" => null, "error" => "pusta komenda", "ignored" => $ignored]; }
+
+    $spec = ["path" => $path, "argv" => $argv, "env" => $envList, "listenPidSlot" => $slot];
+    if ($uid != null) { $spec["uid"] = $uid; $spec["gid"] = $gid ?? $uid; $spec["user"] = $userName; $spec["groups"] = $groups; }
+
+    # katalog roboczy
+    $wd = $u->get("Service", "WorkingDirectory", "");
+    if ($wd != "") {
+        if (starts_with($wd, "-")) { $wd = substr($wd, 1, strlen($wd) - 1); }
+        if ($wd == "~") { $wd = $home; }
+        $spec["dir"] = $wd;
+    }
+    $rd = $u->get("Service", "RootDirectory", "");
+    if ($rd != "") { $spec["root"] = $rd; }
+
+    $um = $u->get("Service", "UMask", "");
+    if ($um != "") { $spec["umask"] = intval(octalToInt($um)); }
+    $nice = $u->get("Service", "Nice", "");
+    if ($nice != "") { $spec["nice"] = util.parseInt($nice, 0); }
+
+    # limity zasobów
+    $limits = [];
+    $lim = [["NOFILE", false], ["NPROC", false], ["CORE", true], ["MEMLOCK", true], ["AS", true], ["CPU", false], ["FSIZE", true], ["DATA", true], ["STACK", true], ["RSS", true]];
+    foreach ($lim as $l) {
+        $raw = $u->get("Service", "Limit" . $l[0], "");
+        if ($raw == "" && $l[0] == "NOFILE") { $raw = $cfg->defaultLimitNofile; }
+        if ($raw == "") { continue; }
+        $v = limitValue($raw, $l[1]);
+        if ($v != null) { $limits[] = [$l[0], $v[0], $v[1]]; }
+    }
+    if (count($limits) > 0) { $spec["limits"] = $limits; }
+
+    # standardowe wejście/wyjście
+    $outFd = $x["outFd"] ?? -1;
+    $in = ioSpec($u->get("Service", "StandardInput", "null"), $u, true, -1);
+    $out = ioSpec($u->get("Service", "StandardOutput", "journal"), $u, false, $outFd);
+    $errRaw = $u->get("Service", "StandardError", "inherit");
+    $err = null;
+    if ($errRaw == "inherit") { $err = $out; if ($err == "inherit" && $outFd >= 0) { $err = "fd:" . strval($outFd); } }
+    else { $err = ioSpec($errRaw, $u, false, $outFd); }
+    if ($in == "inherit" && ($x["isMain"] ?? false) == false) { $in = "null"; }
+    $spec["stdin"] = $in;
+    $spec["stdout"] = $out;
+    $spec["stderr"] = $err;
+    if (count($fds) > 0) { $spec["fds"] = $fds; }
+    if (($x["cgroup"] ?? "") != "") { $spec["cgroup"] = $x["cgroup"]; }
+
+    # piaskownica
+    $sb = [];
+    $any = false;
+    if ($u->getBool("Service", "NoNewPrivileges", false)) { $sb["nnp"] = true; $any = true; }
+    if ($u->getBool("Service", "PrivateTmp", false)) { $sb["ptmp"] = true; $any = true; }
+    if ($u->getBool("Service", "PrivateNetwork", false)) { $sb["pnet"] = true; $any = true; }
+    $ps = lower($u->get("Service", "ProtectSystem", ""));
+    if ($ps != "" && $ps != "no" && $ps != "false" && $ps != "0") {
+        if ($ps == "true" || $ps == "1") { $ps = "yes"; }
+        $sb["psys"] = $ps; $any = true;
+    }
+    $ph = lower($u->get("Service", "ProtectHome", ""));
+    if ($ph != "" && $ph != "no" && $ph != "false" && $ph != "0") {
+        if ($ph == "true" || $ph == "1") { $ph = "yes"; }
+        $sb["phome"] = $ph; $any = true;
+    }
+    $ro = [];
+    foreach (util.concat($u->getList("Service", "ReadOnlyPaths"), $u->getList("Service", "ReadOnlyDirectories")) as $p) { $ro[] = stripPathPrefix($p); }
+    $rw = [];
+    foreach (util.concat($u->getList("Service", "ReadWritePaths"), $u->getList("Service", "ReadWriteDirectories")) as $p) { $rw[] = stripPathPrefix($p); }
+    $na = [];
+    foreach (util.concat($u->getList("Service", "InaccessiblePaths"), $u->getList("Service", "InaccessibleDirectories")) as $p) { $na[] = stripPathPrefix($p); }
+    if (count($ro) > 0) { $sb["ro"] = $ro; $any = true; }
+    if (count($rw) > 0) { $sb["rw"] = $rw; $any = true; }
+    if (count($na) > 0) { $sb["na"] = $na; $any = true; }
+    if ($any) { $spec["sandbox"] = $sb; }
+
+    $cb = $u->getList("Service", "CapabilityBoundingSet");
+    if (count($cb) > 0) {
+        $list = [];
+        $first = true;
+        foreach ($cb as $c) {
+            if ($first && starts_with($c, "~")) { $list[] = "~"; $c = substr($c, 1, strlen($c) - 1); }
+            $first = false;
+            if ($c != "") { $list[] = $c; }
+        }
+        $spec["bounding"] = $list;
+    }
+    $am = $u->getList("Service", "AmbientCapabilities");
+    if (count($am) > 0) { $spec["ambient"] = $am; }
+
+    foreach (["PrivateDevices", "ProtectKernelTunables", "ProtectKernelModules", "ProtectControlGroups", "RestrictAddressFamilies", "SystemCallFilter", "MemoryDenyWriteExecute", "DynamicUser", "RestrictNamespaces", "LockPersonality"] as $k) {
+        if ($u->has("Service", $k)) { $ignored[] = $k; }
+    }
+    return ["spec" => $spec, "error" => "", "ignored" => $ignored];
+}
+
+func stripPathPrefix($p) {
+    while ($p != "" && (starts_with($p, "-") || starts_with($p, "+") || starts_with($p, "!"))) { $p = substr($p, 1, strlen($p) - 1); }
+    return $p;
+}
+
+func octalToInt($s) {
+    $v = 0;
+    foreach (chars(trim($s)) as $c) {
+        if (!is_digit($c)) { return 18; }
+        $v = $v * 8 + intval($c);
+    }
+    return $v;
+}
+
+# StandardInput/Output/Error -> napis dla Sys.spawn; "journal" => fd potoku przechwytującego
+func ioSpec($v, $u, $isInput, $outFd) {
+    if ($v == "inherit") { return "inherit"; }
+    if ($v == "null") { return "null"; }
+    if ($v == "tty" || $v == "tty-force" || $v == "tty-fail") {
+        return "tty:" . $u->get("Service", "TTYPath", "/dev/console");
+    }
+    if (starts_with($v, "file:")) { return $v; }
+    if (starts_with($v, "append:")) { return $v; }
+    if (starts_with($v, "truncate:")) { return "file:" . substr($v, 9, strlen($v) - 9); }
+    if ($v == "journal" || $v == "syslog" || $v == "kmsg" || $v == "journal+console" || $v == "syslog+console" || $v == "kmsg+console") {
+        if ($isInput) { return "null"; }
+        if ($outFd >= 0) { return "fd:" . strval($outFd); }
+        return "null";
+    }
+    if ($v == "socket") { return "inherit"; }
+    return "null";
+}
+
+# Katalogi robocze usługi (Runtime/State/Cache/Logs/ConfigurationDirectory); zwraca listę utworzonych katalogów runtime
+func prepareDirs($sys, $cfg, $u, $uid, $gid) {
+    $created = [];
+    $map = [["RuntimeDirectory", $cfg->runDirBase()], ["StateDirectory", $cfg->stateBase()], ["CacheDirectory", $cfg->cacheBase()],
+            ["LogsDirectory", $cfg->logsBase()], ["ConfigurationDirectory", $cfg->confBase()]];
+    foreach ($map as $m) {
+        foreach ($u->getList("Service", $m[0]) as $d) {
+            $p = util.joinPath($m[1], $d);
+            $mode = 493;
+            $mv = $u->get("Service", $m[0] . "Mode", "");
+            if ($mv != "") { $mode = octalToInt($mv); }
+            $sys->mkdirp($p, $mode);
+            $sys->chmod($p, $mode);
+            if ($uid != null) { $sys->chown($p, $uid, $gid ?? $uid); }
+            if ($m[0] == "RuntimeDirectory") { $created[] = $p; }
+        }
+    }
+    return $created;
+}

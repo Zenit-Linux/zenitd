@@ -1,0 +1,290 @@
+namespace compat;
+import Workspace.util;
+import Workspace.ctl;
+import Workspace.journal;
+import Workspace.proto;
+
+# ───────────── journalctl ─────────────
+
+func prioNum($s) {
+    $names = ["emerg" => 0, "alert" => 1, "crit" => 2, "err" => 3, "warning" => 4, "notice" => 5, "info" => 6, "debug" => 7];
+    $v = $names[lower($s)] ?? null;
+    if ($v != null) { return $v; }
+    return util.parseInt($s, 7);
+}
+
+# --since: "YYYY-MM-DD[ HH:MM[:SS]]", "today", "yesterday", "-5min", "-2h" => ms epoch lub null
+func parseSince($sys, $s) {
+    $s = trim($s);
+    $now = $sys->realMs();
+    if ($s == "today" || $s == "yesterday") {
+        $f = $sys->tm(intval($now / 1000));
+        $t = $sys->mktime($f[0], $f[1], $f[2], 0, 0, 0) * 1000;
+        if ($s == "yesterday") { $t -= 86400000; }
+        return $t;
+    }
+    if (starts_with($s, "-")) {
+        $d = util.parseTimeMs(substr($s, 1, strlen($s) - 1));
+        if ($d == null) { return null; }
+        return $now - $d;
+    }
+    $parts = split($s, " ");
+    $date = split($parts[0], "-");
+    if (count($date) != 3) { return null; }
+    $h = 0; $mi = 0; $se = 0;
+    if (count($parts) > 1) {
+        $tp = split($parts[1], ":");
+        $h = util.parseInt($tp[0], 0);
+        if (count($tp) > 1) { $mi = util.parseInt($tp[1], 0); }
+        if (count($tp) > 2) { $se = util.parseInt($tp[2], 0); }
+    }
+    return $sys->mktime(util.parseInt($date[0], 1970), util.parseInt($date[1], 1), util.parseInt($date[2], 1), $h, $mi, $se) * 1000;
+}
+
+func fmtEntry($e, $sys, $host, $fmt) {
+    if ($fmt == "cat") { return $e[5]; }
+    if ($fmt == "json") {
+        return "{\"__REALTIME_TIMESTAMP\":\"" . strval($e[0] * 1000) . "\",\"_SYSTEMD_UNIT\":\"" . $e[1] . "\",\"_PID\":\"" . strval($e[2]) . "\",\"PRIORITY\":\"" . strval($e[3]) . "\",\"SYSLOG_IDENTIFIER\":\"" . jsonEsc($e[4]) . "\",\"MESSAGE\":\"" . jsonEsc($e[5]) . "\"}";
+    }
+    return journal.fmtShort($e, $sys, $host);
+}
+
+func jsonEsc($s) {
+    $s = replace($s, "\\", "\\\\");
+    $s = replace($s, "\"", "\\\"");
+    $s = replace($s, "\t", "\\t");
+    return replace($s, "\n", "\\n");
+}
+
+func loadAll($sys, $cfg) {
+    $p = journal.readEntries($sys, $cfg->persistLogDir, $cfg->logKeep);
+    if (count($p) > 0) { return $p; }
+    return journal.readEntries($sys, $cfg->volatileLogDir, $cfg->logKeep);
+}
+
+func journalctl($sys, $cfg, $args) {
+    $units = [];
+    $n = -1;
+    $follow = false;
+    $boot = false;
+    $prio = 7;
+    $rev = false;
+    $fmt = "short";
+    $since = 0;
+    $grep = "";
+    $kernel = false;
+    $i = 0;
+    $c = count($args);
+    while ($i < $c) {
+        $a = $args[$i];
+        $i += 1;
+        if ($a == "-u" || $a == "--unit") { if ($i < $c) { $units[] = util.normalizeName($args[$i]); $i += 1; } }
+        elseif (starts_with($a, "--unit=")) { $units[] = util.normalizeName(substr($a, 7, strlen($a) - 7)); }
+        elseif ($a == "-n" || $a == "--lines") { if ($i < $c) { $n = util.parseInt($args[$i], 10); $i += 1; } }
+        elseif (starts_with($a, "--lines=")) { $n = util.parseInt(substr($a, 8, strlen($a) - 8), 10); }
+        elseif (starts_with($a, "-n") && strlen($a) > 2) { $n = util.parseInt(substr($a, 2, strlen($a) - 2), 10); }
+        elseif ($a == "-f" || $a == "--follow") { $follow = true; }
+        elseif ($a == "-b" || $a == "--boot") { $boot = true; }
+        elseif ($a == "-r" || $a == "--reverse") { $rev = true; }
+        elseif ($a == "-k" || $a == "--dmesg") { $kernel = true; }
+        elseif ($a == "-p" || $a == "--priority") { if ($i < $c) { $prio = prioNum($args[$i]); $i += 1; } }
+        elseif (starts_with($a, "--priority=")) { $prio = prioNum(substr($a, 11, strlen($a) - 11)); }
+        elseif ($a == "-o" || $a == "--output") { if ($i < $c) { $fmt = $args[$i]; $i += 1; } }
+        elseif (starts_with($a, "--output=")) { $fmt = substr($a, 9, strlen($a) - 9); }
+        elseif ($a == "-g" || $a == "--grep") { if ($i < $c) { $grep = $args[$i]; $i += 1; } }
+        elseif (starts_with($a, "--grep=")) { $grep = substr($a, 7, strlen($a) - 7); }
+        elseif ($a == "-S" || $a == "--since") {
+            if ($i < $c) { $t = parseSince($sys, $args[$i]); $i += 1; if ($t != null) { $since = $t; } }
+        }
+        elseif (starts_with($a, "--since=")) { $t = parseSince($sys, substr($a, 8, strlen($a) - 8)); if ($t != null) { $since = $t; } }
+        elseif ($a == "--no-pager" || $a == "-q" || $a == "--quiet" || $a == "-x" || $a == "-e" || $a == "--utc" || $a == "--no-hostname" || $a == "-a" || $a == "--all") { }
+        elseif ($a == "--version") { necho("journalctl (zenitd 0.1.0)\n"); return 0; }
+        elseif (starts_with($a, "-")) { eecho("journalctl: nieznana opcja " . $a); return 1; }
+        else { $units[] = util.normalizeName($a); }
+    }
+    if ($kernel) {
+        $r = $sys->execv("/bin/dmesg", ["dmesg"]);
+        eecho("Nie można uruchomić dmesg");
+        return 1;
+    }
+    $host = $sys->hostname() ?? "localhost";
+    $all = loadAll($sys, $cfg);
+    if ($boot) {
+        $b = journal.lastBootMs($all);
+        if ($b > $since) { $since = $b; }
+    }
+    if ($n < 0 && !$follow) { $n = -1; }
+    if ($n < 0 && $follow) { $n = 10; }
+    $sel = [];
+    if (count($units) == 0) { $sel = journal.filter($all, "", $prio, $since, $grep); }
+    else {
+        foreach ($units as $u) {
+            foreach (journal.filter($all, $u, $prio, $since, $grep) as $e) { $sel[] = $e; }
+        }
+        if (count($units) > 1) { $sel = sortByTime($sel); }
+    }
+    $sel = journal.tail($sel, $n);
+    if ($rev) { $r2 = []; $k = count($sel) - 1; while ($k >= 0) { $r2[] = $sel[$k]; $k -= 1; } $sel = $r2; }
+    foreach ($sel as $e) { necho(fmtEntry($e, $sys, $host, $fmt) . "\n"); }
+    if (!$follow) { return 0; }
+    $lastTs = 0;
+    $lastCount = 0;
+    foreach ($sel as $e) {
+        if ($e[0] > $lastTs) { $lastTs = $e[0]; $lastCount = 0; }
+        if ($e[0] == $lastTs) { $lastCount += 1; }
+    }
+    while (true) {
+        $sys->sleepMs(500);
+        $all = loadAll($sys, $cfg);
+        $new = [];
+        $seenAtTs = 0;
+        foreach ($all as $e) {
+            if ($e[0] < $lastTs) { continue; }
+            if ($e[0] == $lastTs) {
+                $seenAtTs += 1;
+                if ($seenAtTs <= $lastCount) { continue; }
+            }
+            $new[] = $e;
+        }
+        $f = [];
+        if (count($units) == 0) { $f = journal.filter($new, "", $prio, 0, $grep); }
+        else { foreach ($units as $u) { foreach (journal.filter($new, $u, $prio, 0, $grep) as $e) { $f[] = $e; } } }
+        foreach ($f as $e) { necho(fmtEntry($e, $sys, $host, $fmt) . "\n"); }
+        foreach ($new as $e) {
+            if ($e[0] > $lastTs) { $lastTs = $e[0]; $lastCount = 0; }
+            if ($e[0] == $lastTs) { $lastCount += 1; }
+        }
+    }
+    return 0;
+}
+
+func sortByTime($list) {
+    $n = count($list);
+    $i = 1;
+    while ($i < $n) {
+        $x = $list[$i];
+        $j = $i - 1;
+        while ($j >= 0 && $list[$j][0] > $x[0]) { $list[$j + 1] = $list[$j]; $j -= 1; }
+        $list[$j + 1] = $x;
+        $i += 1;
+    }
+    return $list;
+}
+
+# ───────────── reboot / poweroff / halt / shutdown / telinit ─────────────
+
+func powerCall($sys, $cfg, $verb, $force) {
+    $c = new Ctl($sys, $cfg);
+    $r = $c->call([$verb]);
+    if ($r == null) {
+        if ($force) {
+            return $sys->reboot($verb == "reboot" ? "reboot" : ($verb == "halt" ? "halt" : "poweroff"));
+        }
+        eecho("zenitd nie działa — nie mogę wykonać: " . $verb);
+        return 1;
+    }
+    if ($r[0] != 0) { eecho(trim($r[1])); }
+    return $r[0];
+}
+
+# opóźnienie w sekundach z argumentu czasu shutdown: now, +m, hh:mm; null gdy niepoprawny
+func shutdownDelay($sys, $t) {
+    if ($t == "now" || $t == "+0" || $t == "0") { return 0; }
+    if (starts_with($t, "+")) { return util.parseInt(substr($t, 1, strlen($t) - 1), -1) * 60; }
+    $p = split($t, ":");
+    if (count($p) == 2) {
+        $nowF = $sys->tm(intval($sys->realMs() / 1000));
+        $target = $nowF[3] * 3600 + $nowF[4] * 60;
+        $want = util.parseInt($p[0], 0) * 3600 + util.parseInt($p[1], 0) * 60;
+        $d = $want - $target;
+        if ($d < 0) { $d += 86400; }
+        return $d;
+    }
+    return null;
+}
+
+func powerApplet($sys, $cfg, $name, $args) {
+    $verb = "poweroff";
+    if ($name == "reboot") { $verb = "reboot"; }
+    elseif ($name == "halt") { $verb = "halt"; }
+    $force = false;
+    $when = "now";
+    $cancel = false;
+    $i = 0;
+    $seenTime = false;
+    foreach ($args as $a) {
+        if ($a == "-f" || $a == "--force") { $force = true; }
+        elseif ($a == "-r" || $a == "--reboot") { $verb = "reboot"; }
+        elseif ($a == "-h" || $a == "-P" || $a == "--poweroff") { if ($name == "shutdown" || $name == "poweroff") { $verb = "poweroff"; } }
+        elseif ($a == "-H" || $a == "--halt") { $verb = "halt"; }
+        elseif ($a == "-c") { $cancel = true; }
+        elseif ($a == "-k" || $a == "--no-wall" || $a == "-w" || $a == "-d" || $a == "-n" || $a == "-p" || $a == "--no-sync" || $a == "-q") { }
+        elseif (starts_with($a, "-")) { }
+        elseif ($name == "shutdown" && !$seenTime) { $when = $a; $seenTime = true; }
+    }
+    if ($cancel) { eecho("Anulowanie zaplanowanego zamknięcia nie jest obsługiwane."); return 1; }
+    $delay = shutdownDelay($sys, $when);
+    if ($delay == null || $delay < 0) { eecho("shutdown: niepoprawny czas: " . $when); return 1; }
+    if ($delay > 0) {
+        # opóźnienie: odłączony pomocnik czeka i wywołuje to samo polecenie
+        $self = $sys->readlink("/proc/self/exe") ?? "/sbin/zenitd";
+        $spec = ["path" => "/bin/sh", "argv" => ["sh", "-c", "sleep " . strval($delay) . " && exec \"$0\" --applet=" . $verb . " now", $self],
+                 "env" => ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"], "stdin" => "null", "stdout" => "null", "stderr" => "null"];
+        $pid = $sys->spawn($spec);
+        if ($pid < 0) { eecho("shutdown: nie można zaplanować: " . $sys->errstr($pid)); return 1; }
+        necho("Zamknięcie zaplanowane za " . util.fmtDuration($delay * 1000) . " (" . $verb . ")\n");
+        return 0;
+    }
+    return powerCall($sys, $cfg, $verb, $force);
+}
+
+# telinit / init N
+func telinit($sys, $cfg, $args) {
+    if (count($args) == 0) { eecho("użycie: telinit POZIOM"); return 1; }
+    $l = $args[0];
+    $c = new Ctl($sys, $cfg);
+    $map = ["0" => "poweroff", "6" => "reboot", "1" => "rescue", "s" => "rescue", "S" => "rescue", "2" => "multi-user", "3" => "multi-user", "4" => "multi-user", "5" => "graphical"];
+    if ($l == "q" || $l == "Q" || $l == "u" || $l == "U") { return $c->run(["daemon-reload"]); }
+    $v = $map[$l] ?? null;
+    if ($v == null) { eecho("telinit: nieznany poziom " . $l); return 1; }
+    if ($v == "poweroff" || $v == "reboot") { return powerCall($sys, $cfg, $v, false); }
+    return $c->run(["isolate", $v . ".target"]);
+}
+
+# ───────────── systemd-notify ─────────────
+
+func notifyApplet($sys, $args) {
+    $lines = [];
+    $pid = 0;
+    foreach ($args as $a) {
+        if ($a == "--ready") { $lines[] = "READY=1"; }
+        elseif ($a == "--reloading") { $lines[] = "RELOADING=1"; }
+        elseif ($a == "--stopping") { $lines[] = "STOPPING=1"; }
+        elseif (starts_with($a, "--status=")) { $lines[] = "STATUS=" . substr($a, 9, strlen($a) - 9); }
+        elseif ($a == "--pid") { $lines[] = "MAINPID=" . strval($sys->ppid()); }
+        elseif (starts_with($a, "--pid=")) { $lines[] = "MAINPID=" . substr($a, 6, strlen($a) - 6); }
+        elseif ($a == "--booted") { return $sys->exists("/run/zenit/control") ? 0 : 1; }
+        elseif (starts_with($a, "--")) { }
+        elseif (contains($a, "=")) { $lines[] = $a; }
+    }
+    $path = System.env("NOTIFY_SOCKET");
+    if ($path == null || $path == "") { eecho("systemd-notify: NOTIFY_SOCKET nie jest ustawione"); return 1; }
+    $fd = $sys->connectDgram($path);
+    if ($fd < 0) { eecho("systemd-notify: " . $sys->errstr($fd)); return 1; }
+    $r = $sys->write($fd, join($lines, "\n"));
+    $sys->close($fd);
+    return $r < 0 ? 1 : 0;
+}
+
+# Wybór apletu po nazwie; zwraca kod wyjścia albo -1 gdy to nie aplet kliencki
+func dispatch($sys, $cfg, $name, $args) {
+    if ($name == "systemctl" || $name == "zenitctl") {
+        $c = new Ctl($sys, $cfg);
+        return $c->run($args);
+    }
+    if ($name == "journalctl") { return journalctl($sys, $cfg, $args); }
+    if ($name == "reboot" || $name == "poweroff" || $name == "halt" || $name == "shutdown") { return powerApplet($sys, $cfg, $name, $args); }
+    if ($name == "telinit") { return telinit($sys, $cfg, $args); }
+    if ($name == "systemd-notify" || $name == "zenit-notify") { return notifyApplet($sys, $args); }
+    return -1;
+}

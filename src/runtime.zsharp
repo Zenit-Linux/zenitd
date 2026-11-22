@@ -1,0 +1,164 @@
+namespace runtime;
+import Workspace.util;
+
+class Runtime {
+    public $unit;
+    public $state = "inactive";       # inactive | activating | active | deactivating | failed
+    public $sub = "dead";
+    public $result = "success";
+    public $enteredMs = 0;            # monotoniczny czas wejścia w bieżący stan
+    public $activeEnterReal = 0;      # czas (ms epoch) ostatniej aktywacji
+    public $inactiveEnterReal = 0;
+    public $activatingMono = 0;
+    public $activationMs = -1;        # czas trwania aktywacji (dla analyze blame)
+    public $mgr = null;
+
+    public func __construct($unit) { $this->unit = $unit; }
+
+    public func name() { return $this->unit->name; }
+
+    public func setState($mgr, $state, $sub) {
+        $old = $this->state;
+        $oldSub = $this->sub;
+        if ($old == $state && $oldSub == $sub) { return 0; }
+        $now = $mgr->sys->monoMs();
+        if ($state == "activating" && $old != "activating") { $this->activatingMono = $now; }
+        if ($state == "active" && $old != "active") {
+            $this->activeEnterReal = $mgr->sys->realMs();
+            if ($this->activatingMono > 0) { $this->activationMs = $now - $this->activatingMono; }
+        }
+        if (($state == "inactive" || $state == "failed") && ($old == "active" || $old == "deactivating" || $old == "activating")) {
+            $this->inactiveEnterReal = $mgr->sys->realMs();
+        }
+        $this->state = $state;
+        $this->sub = $sub;
+        $this->enteredMs = $now;
+        $mgr->changed($this, $old);
+        return 0;
+    }
+
+    public func isActive() { return $this->state == "active"; }
+    public func isActivating() { return $this->state == "activating"; }
+    public func isRunning() { return $this->state == "active" || $this->state == "activating" || $this->state == "deactivating"; }
+
+    public func start($mgr) { return 0; }
+    public func stop($mgr) { return 0; }
+    public func reload($mgr) { return 0; }
+    public func onExit($mgr, $pid, $status) { return 0; }
+    public func onTick($mgr, $now) { return 0; }
+    public func nextWake() { return -1; }
+    public func onNotify($mgr, $kv) { return 0; }
+    public func onFd($mgr, $fd, $flags, $kind) { return 0; }
+    public func resetFailed($mgr) {
+        if ($this->state == "failed") {
+            $this->result = "success";
+            $this->setState($mgr, "inactive", "dead");
+        }
+        return 0;
+    }
+    public func describe($mgr) { return []; }
+    public func mainPidValue() { return 0; }
+}
+
+# Target: grupa jednostek; „aktywny”, gdy Manager ukończył zadania jego zależności
+class Target extends Runtime {
+    public func start($mgr) {
+        if ($this->state == "active") { return 0; }
+        $this->setState($mgr, "active", "active");
+        return 0;
+    }
+    public func stop($mgr) {
+        if ($this->state == "inactive") { return 0; }
+        $this->setState($mgr, "inactive", "dead");
+        return 0;
+    }
+}
+
+# ───────────── warunki ─────────────
+
+func negated($v) { return starts_with($v, "!"); }
+func stripNeg($v) { if (starts_with($v, "!")) { return substr($v, 1, strlen($v) - 1); } return $v; }
+
+func isMountPoint($mgr, $path) {
+    $t = $mgr->sys->readFile("/proc/self/mountinfo", 1048576);
+    if ($t == null) { return false; }
+    foreach (split($t, "\n") as $l) {
+        $f = split($l, " ");
+        if (count($f) > 4 && $f[4] == $path) { return true; }
+    }
+    return false;
+}
+
+# Sprawdza jedną dyrektywę; zwraca true gdy warunek spełniony
+func checkOne($mgr, $key, $raw) {
+    $neg = negated($raw);
+    $v = stripNeg($raw);
+    $sys = $mgr->sys;
+    $r = true;
+    if ($key == "PathExists") { $r = $sys->exists($v); }
+    elseif ($key == "PathExistsGlob") { $r = $sys->exists($v); }
+    elseif ($key == "PathIsDirectory") { $r = $sys->isDir($v); }
+    elseif ($key == "PathIsSymbolicLink") { $r = $sys->stat($v) == 3; }
+    elseif ($key == "PathIsReadWrite") { $r = $sys->access($v, 2) >= 0; }
+    elseif ($key == "PathIsMountPoint") { $r = isMountPoint($mgr, $v); }
+    elseif ($key == "FileNotEmpty") { $r = $sys->stat($v) != 0 && $sys->size($v) > 0; }
+    elseif ($key == "FileIsExecutable") { $r = $sys->stat($v) != 0 && $sys->access($v, 1) >= 0; }
+    elseif ($key == "DirectoryNotEmpty") { $l = $sys->dirList($v); $r = $l != null && count($l) > 0; }
+    elseif ($key == "Virtualization") {
+        $w = lower($v);
+        if ($w == "container") { $r = $mgr->cfg->container; }
+        elseif ($w == "no" || $w == "false") { $r = !$mgr->cfg->container; }
+        elseif ($w == "yes" || $w == "true" || $w == "vm") { $r = $mgr->cfg->container; }
+        else { $r = $mgr->cfg->container; }
+    }
+    elseif ($key == "KernelCommandLine") {
+        $r = false;
+        foreach (util.splitWords($mgr->cfg->kernelCmdline) as $w) {
+            if ($w == $v || starts_with($w, $v . "=")) { $r = true; }
+        }
+    }
+    elseif ($key == "Host") { $r = $sys->hostname() == $v; }
+    elseif ($key == "User") {
+        if ($v == "root") { $r = $sys->uid() == 0; }
+        elseif ($v == "@system") { $r = $sys->uid() < 1000; }
+        else { $r = strval($sys->uid()) == $v || $sys->userUid($v) == $sys->uid(); }
+    }
+    elseif ($key == "Architecture") {
+        $a = $sys->arch ?? "x86_64";
+        $r = $v == $a || ($v == "x86-64" && $a == "x86_64") || ($v == "arm64" && $a == "aarch64");
+    }
+    elseif ($key == "ACPower") { $r = true; }
+    elseif ($key == "FirstBoot" || $key == "NeedsUpdate") { $r = false; }
+    elseif ($key == "Security" || $key == "Capability" || $key == "ControlGroupController") { $r = true; }
+    elseif ($key == "Environment") { $r = System.env($v) != null; }
+    else { $r = true; }
+    if ($neg) { return !$r; }
+    return $r;
+}
+
+# "" gdy wszystkie warunki spełnione, w przeciwnym razie opis pierwszego niespełnionego.
+# $assert=true sprawdza Assert*, false — Condition*. Wiele wartości jednego klucza: wszystkie muszą być spełnione
+# (z wyjątkiem „|” — wystarczy jedna z grupy).
+func failedCondition($mgr, $u, $assert) {
+    $prefix = "Condition";
+    if ($assert) { $prefix = "Assert"; }
+    $sec = $u->sec["Unit"] ?? [];
+    $orGroup = [];
+    $orFailed = "";
+    foreach (keys($sec) as $k) {
+        if (!starts_with($k, $prefix)) { continue; }
+        $short = substr($k, strlen($prefix), strlen($k) - strlen($prefix));
+        foreach ($sec[$k] as $val) {
+            $raw = $val;
+            $triggered = false;
+            if (starts_with($raw, "|")) { $triggered = true; $raw = substr($raw, 1, strlen($raw) - 1); }
+            $ok = checkOne($mgr, $short, $raw);
+            if ($triggered) {
+                $orGroup[] = $ok;
+                if (!$ok && $orFailed == "") { $orFailed = $k . "=" . $val; }
+            } elseif (!$ok) { return $k . "=" . $val; }
+        }
+    }
+    if (count($orGroup) > 0 && !util.contains_item($orGroup, true)) { return $orFailed; }
+    return "";
+}

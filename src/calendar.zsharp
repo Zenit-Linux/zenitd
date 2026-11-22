@@ -1,0 +1,140 @@
+namespace calendar;
+import Workspace.util;
+
+# lista dozwolonych wartości dla pola albo null (= dowolna)
+func parseField($s, $min, $max) {
+    if ($s == "*") { return null; }
+    $out = [];
+    foreach (split($s, ",") as $part) {
+        $step = 1;
+        $slash = index_of($part, "/");
+        if ($slash >= 0) {
+            $step = util.parseInt(substr($part, $slash + 1, strlen($part) - $slash - 1), 0);
+            $part = substr($part, 0, $slash);
+            if ($step < 1) { return false; }
+        }
+        $lo = $min;
+        $hi = $max;
+        if ($part == "*") { }
+        else {
+            $dd = index_of($part, "..");
+            if ($dd >= 0) {
+                $lo = util.parseInt(substr($part, 0, $dd), -1);
+                $hi = util.parseInt(substr($part, $dd + 2, strlen($part) - $dd - 2), -1);
+            } else {
+                $lo = util.parseInt($part, -1);
+                $hi = $lo;
+                if ($slash >= 0) { $hi = $max; }
+            }
+        }
+        if ($lo < $min || $hi > $max || $lo > $hi) { return false; }
+        $v = $lo;
+        while ($v <= $hi) { $out[] = $v; $v += $step; }
+    }
+    return $out;
+}
+
+func dowNum($s) {
+    $names = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    $t = lower(substr($s, 0, 3));
+    $i = 0;
+    while ($i < 7) { if ($names[$i] == $t) { return $i; } $i += 1; }
+    return -1;
+}
+
+func parseDow($s) {
+    $out = [];
+    foreach (split($s, ",") as $part) {
+        $dd = index_of($part, "..");
+        if ($dd >= 0) {
+            $a = dowNum(substr($part, 0, $dd));
+            $b = dowNum(substr($part, $dd + 2, strlen($part) - $dd - 2));
+            if ($a < 0 || $b < 0) { return false; }
+            $v = $a;
+            $guard = 0;
+            while ($guard < 8) {
+                $out[] = $v;
+                if ($v == $b) { break; }
+                $v = ($v + 1) % 7;
+                $guard += 1;
+            }
+        } else {
+            $d = dowNum($part);
+            if ($d < 0) { return false; }
+            $out[] = $d;
+        }
+    }
+    return $out;
+}
+
+# Zwraca tablicę ["dow","year","mon","day","hour","min","sec"] albo null przy błędzie
+func parse($expr) {
+    $e = lower(trim($expr));
+    if ($e == "minutely") { $e = "*-*-* *:*:00"; }
+    elseif ($e == "hourly") { $e = "*-*-* *:00:00"; }
+    elseif ($e == "daily") { $e = "*-*-* 00:00:00"; }
+    elseif ($e == "weekly") { $e = "mon *-*-* 00:00:00"; }
+    elseif ($e == "monthly") { $e = "*-*-01 00:00:00"; }
+    elseif ($e == "quarterly") { $e = "*-01,04,07,10-01 00:00:00"; }
+    elseif ($e == "semiannually" || $e == "semi-annually") { $e = "*-01,07-01 00:00:00"; }
+    elseif ($e == "yearly" || $e == "annually") { $e = "*-01-01 00:00:00"; }
+    $words = util.splitWords($e);
+    $dow = null;
+    $date = null;
+    $time = null;
+    foreach ($words as $w) {
+        if (contains($w, ":")) { $time = $w; }
+        elseif (contains($w, "-") && !is_alpha(substr($w, 0, 1))) { $date = $w; }
+        elseif (is_alpha(substr($w, 0, 1))) {
+            $dow = parseDow($w);
+            if ($dow === false) { return null; }
+        } else { return null; }
+    }
+    if ($date == null && $time == null && $dow == null) { return null; }
+    if ($time == null) { $time = "00:00:00"; }
+    if ($date == null) { $date = "*-*-*"; }
+    $dp = split($date, "-");
+    if (count($dp) == 2) { $dp = ["*", $dp[0], $dp[1]]; }
+    if (count($dp) != 3) { return null; }
+    $tp = split($time, ":");
+    if (count($tp) == 2) { $tp[] = "00"; }
+    if (count($tp) != 3) { return null; }
+    $y = parseField($dp[0], 1970, 2200);
+    $mo = parseField($dp[1], 1, 12);
+    $d = parseField($dp[2], 1, 31);
+    $h = parseField($tp[0], 0, 23);
+    $mi = parseField($tp[1], 0, 59);
+    $s = parseField($tp[2], 0, 59);
+    if ($y === false || $mo === false || $d === false || $h === false || $mi === false || $s === false) { return null; }
+    return ["dow" => $dow, "year" => $y, "mon" => $mo, "day" => $d, "hour" => $h, "min" => $mi, "sec" => $s];
+}
+
+func allowed($list, $v) {
+    if ($list == null) { return true; }
+    return util.contains_item($list, $v);
+}
+
+# Najbliższy moment ściśle po $after (epoch s) pasujący do $spec albo -1 (limit ~5 lat).
+func next($spec, $after, $sys) {
+    $t = $after + 1;
+    $guard = 0;
+    while ($guard < 200000) {
+        $guard += 1;
+        $f = $sys->tm($t);
+        $y = $f[0]; $mo = $f[1]; $d = $f[2]; $h = $f[3]; $mi = $f[4]; $s = $f[5]; $wd = $f[6];
+        if ($y > 2200) { return -1; }
+        if (!allowed($spec["year"], $y)) { $t = $sys->mktime($y + 1, 1, 1, 0, 0, 0); continue; }
+        if (!allowed($spec["mon"], $mo)) {
+            $ny = $y; $nm = $mo + 1;
+            if ($nm > 12) { $nm = 1; $ny += 1; }
+            $t = $sys->mktime($ny, $nm, 1, 0, 0, 0);
+            continue;
+        }
+        if (!allowed($spec["day"], $d) || !allowed($spec["dow"], $wd)) { $t = $sys->mktime($y, $mo, $d + 1, 0, 0, 0); continue; }
+        if (!allowed($spec["hour"], $h)) { $t = $sys->mktime($y, $mo, $d, $h + 1, 0, 0); continue; }
+        if (!allowed($spec["min"], $mi)) { $t = $sys->mktime($y, $mo, $d, $h, $mi + 1, 0); continue; }
+        if (!allowed($spec["sec"], $s)) { $t += 1; continue; }
+        return $t;
+    }
+    return -1;
+}

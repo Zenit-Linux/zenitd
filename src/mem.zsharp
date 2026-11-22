@@ -1,0 +1,82 @@
+func i32($v) {
+    $v = $v & 4294967295;
+    if ($v >= 2147483648) { return $v - 4294967296; }
+    return $v;
+}
+
+class Mem {
+    public $zero;
+
+    public func __construct() {
+        $this->zero = malloc(16);
+        memset($this->zero, 0, 16);
+    }
+
+    public func alloc($n) {
+        $p = malloc($n + 8);
+        memset($p, 0, $n + 8);
+        return $p;
+    }
+
+    public func release($p) {
+        if ($p != 0) { free($p); }
+    }
+
+    public func peek8($a) { return i32(memcmp($a, $this->zero, 1)); }
+    public func peek16($a) { return $this->peek8($a) | ($this->peek8($a + 1) << 8); }
+    public func peek32($a) {
+        return $this->peek8($a) | ($this->peek8($a + 1) << 8) | ($this->peek8($a + 2) << 16) | ($this->peek8($a + 3) << 24);
+    }
+    public func peeki32($a) { return i32($this->peek32($a)); }
+    public func peek64($a) { return $this->peek32($a) | ($this->peek32($a + 4) << 32); }
+
+    public func poke8($a, $v) { memset($a, $v & 255, 1); }
+    public func poke16($a, $v) { $this->poke8($a, $v); $this->poke8($a + 1, $v >> 8); }
+    public func poke32($a, $v) {
+        $this->poke8($a, $v); $this->poke8($a + 1, $v >> 8);
+        $this->poke8($a + 2, $v >> 16); $this->poke8($a + 3, $v >> 24);
+    }
+    public func poke64($a, $v) { $this->poke32($a, $v); $this->poke32($a + 4, $v >> 32); }
+
+    # napis C spod adresu (null dla wskaźnika zerowego)
+    public func cstr($p) {
+        if ($p == 0) { return null; }
+        return strstr($p, "");
+    }
+
+    # kopiuje napis do pamięci i dopisuje NUL
+    public func put($p, $s) {
+        $n = strlen($s);
+        if ($n > 0) { memcpy($p, $s, $n); }
+        $this->poke8($p + $n, 0);
+        return $n;
+    }
+
+    # nowy, zerowany bufor zawierający napis (wołający zwalnia przez release)
+    public func newstr($s) {
+        $p = $this->alloc(strlen($s) + 1);
+        $this->put($p, $s);
+        return $p;
+    }
+
+    # tablica wskaźników char* zakończona NULL (dla execve)
+    public func strarray($list) {
+        $n = count($list);
+        $arr = $this->alloc(($n + 1) * 8);
+        $i = 0;
+        while ($i < $n) {
+            $this->poke64($arr + $i * 8, strdup($list[$i]));
+            $i += 1;
+        }
+        return $arr;
+    }
+
+    public func freearray($arr, $n) {
+        $i = 0;
+        while ($i < $n) {
+            free($this->peek64($arr + $i * 8));
+            $i += 1;
+        }
+        free($arr);
+    }
+}

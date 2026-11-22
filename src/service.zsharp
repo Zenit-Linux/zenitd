@@ -1,0 +1,778 @@
+namespace service;
+import Workspace.util;
+import Workspace.runtime;
+import Workspace.execspec;
+import Workspace.proto;
+
+class Service extends Runtime {
+    public $phase = "dead";
+    public $queue = [];
+    public $mainPid = 0;
+    public $controlPid = 0;
+    public $ctrlIgnore = false;
+    public $deadline = -1;
+    public $pollAt = -1;
+    public $watchdogAt = -1;
+    public $cgPath = "";
+    public $notifyFd = -1;
+    public $notifyPath = "";
+    public $outR = -1;
+    public $outW = -1;
+    public $restarts = 0;
+    public $startTimes = [];
+    public $manualStop = false;
+    public $pendingStart = false;
+    public $ready = false;
+    public $mainExited = false;
+    public $mainStatus = 0;
+    public $mainStatusKnown = false;
+    public $statusText = "";
+    public $runtimeDirs = [];
+    public $failMsg = "";
+    public $passFds = [];
+    public $passNames = [];
+    public $viaSocket = false;
+    public $ignoredNote = [];
+    public $conditionMsg = "";
+    public $startedReal = 0;
+
+    # ───────────── pomocnicze ─────────────
+
+    public func svcType() {
+        $t = lower($this->unit->get("Service", "Type", ""));
+        if ($t == "") {
+            if (!$this->unit->has("Service", "ExecStart")) { return "oneshot"; }
+            return "simple";
+        }
+        if ($t == "dbus") { return "simple"; }
+        return $t;
+    }
+
+    func timeoutStart($mgr) {
+        $d = $mgr->cfg->timeoutStartMs;
+        if ($this->svcType() == "oneshot") { $d = -1; }
+        $ts = $this->unit->getTimeMs("Service", "TimeoutSec", $d);
+        return $this->unit->getTimeMs("Service", "TimeoutStartSec", $ts);
+    }
+    func timeoutStop($mgr) {
+        $ts = $this->unit->getTimeMs("Service", "TimeoutSec", $mgr->cfg->timeoutStopMs);
+        return $this->unit->getTimeMs("Service", "TimeoutStopSec", $ts);
+    }
+    func restartMs($mgr) { return $this->unit->getTimeMs("Service", "RestartSec", $mgr->cfg->restartMs); }
+
+    func deadlineIn($mgr, $ms) {
+        if ($ms < 0) { $this->deadline = -1; return 0; }
+        $this->deadline = $mgr->sys->monoMs() + $ms;
+        return 0;
+    }
+
+    func parseCmds($key, $env) {
+        $out = [];
+        foreach ($this->unit->getAll("Service", $key) as $line) {
+            $c = util.parseExec($line, $env);
+            if ($c != null) { $out[] = $c; }
+        }
+        return $out;
+    }
+
+    func successStatus($status) {
+        if ($status == 0) { return true; }
+        foreach ($this->unit->getList("Service", "SuccessExitStatus") as $w) {
+            if ($status < 256 && strval($status) == $w) { return true; }
+            if ($status >= 256 && $this->sigName($status - 256) == $w) { return true; }
+        }
+        return false;
+    }
+    func sigName($n) {
+        $names = ["", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM"];
+        if ($n >= 0 && $n < 16) { return $names[$n]; }
+        return strval($n);
+    }
+
+    # kategoria wyniku dla statusu procesu głównego: success | exit-code | signal
+    func classify($status) {
+        if ($this->successStatus($status)) { return "success"; }
+        if ($status >= 256) {
+            $s = ($status - 256) % 512;
+            if ($s == 1 || $s == 2 || $s == 15 || $s == 13) { return "success"; }
+            return "signal";
+        }
+        return "exit-code";
+    }
+
+    func log($mgr, $prio, $msg) { $mgr->log($prio, $this->name(), $msg); }
+
+    # ───────────── start ─────────────
+
+    public func start($mgr) {
+        if (($this->state == "active" || $this->state == "activating") && $this->phase != "auto-restart") { return 0; }
+        if ($this->state == "deactivating") { $this->pendingStart = true; return 0; }
+        $this->phase = "dead";
+        $this->deadline = -1;
+        $cond = runtime.failedCondition($mgr, $this->unit, false);
+        if ($cond != "") {
+            $this->conditionMsg = $cond;
+            $this->log($mgr, 6, "Warunek niespełniony: " . $cond . " — jednostka pominięta");
+            $this->setState($mgr, "inactive", "condition-failed");
+            return 0;
+        }
+        $asrt = runtime.failedCondition($mgr, $this->unit, true);
+        if ($asrt != "") {
+            $this->failMsg = "Assert niespełniony: " . $asrt;
+            $this->result = "assert";
+            $this->log($mgr, 3, $this->failMsg);
+            $this->setState($mgr, "failed", "failed");
+            return 0;
+        }
+        # limit startów
+        $now = $mgr->sys->monoMs();
+        $interval = $this->unit->getTimeMs("Unit", "StartLimitIntervalSec", $mgr->cfg->startLimitIntervalMs);
+        $burst = $this->unit->getInt("Unit", "StartLimitBurst", $mgr->cfg->startLimitBurst);
+        $keep = [];
+        foreach ($this->startTimes as $t) { if ($interval < 0 || $now - $t < $interval) { $keep[] = $t; } }
+        $this->startTimes = $keep;
+        if ($interval != 0 && count($keep) >= $burst) {
+            $this->result = "start-limit-hit";
+            $this->failMsg = "Zbyt szybkie ponowne starty (start-limit-hit)";
+            $this->log($mgr, 3, $this->failMsg);
+            $this->setState($mgr, "failed", "start-limit-hit");
+            return 0;
+        }
+        $this->startTimes[] = $now;
+        $this->manualStop = false;
+        $this->pendingStart = false;
+        $this->result = "success";
+        $this->failMsg = "";
+        $this->mainExited = false;
+        $this->mainStatusKnown = false;
+        $this->ready = false;
+        $this->statusText = "";
+        $this->setState($mgr, "activating", "start-pre");
+        $this->phase = "start-pre";
+        if (!$this->prepare($mgr)) { return 0; }
+        $this->runPhase($mgr, "start-pre", $this->parseCmds("ExecStartPre", $this->baseEnv()));
+        return 0;
+    }
+
+    func baseEnv() {
+        $m = [];
+        foreach ($this->unit->getAll("Service", "Environment") as $l) {
+            $p = execspec.parseEnvironmentLine($l);
+            foreach (keys($p) as $k) { $m[$k] = $p[$k]; }
+        }
+        if ($this->mainPid > 0) { $m["MAINPID"] = strval($this->mainPid); }
+        return $m;
+    }
+
+    # zasoby: cgroup, potok logów, gniazdo notify, katalogi; false => abort już wykonany
+    func prepare($mgr) {
+        $this->cgPath = $mgr->cg->create($this->name());
+        if ($this->cgPath != "") { $mgr->cg->applyLimits($this->cgPath, $this->unit); }
+        $p = $mgr->sys->pipe();
+        if ($p != null) {
+            $this->outR = $p[0];
+            $this->outW = $p[1];
+            $mgr->watch($this->outR, "log", $this->name());
+        }
+        $needNotify = $this->svcType() == "notify" || $this->unit->has("Service", "NotifyAccess") || $this->unit->has("Service", "WatchdogSec");
+        if ($needNotify) {
+            $this->notifyPath = $mgr->notifyPathFor($this->name());
+            $fd = $mgr->sys->bindDgram($this->notifyPath, 438);
+            if ($fd >= 0) {
+                $this->notifyFd = $fd;
+                $mgr->watch($fd, "notify", $this->name());
+            } else { $this->notifyPath = ""; }
+        }
+        $this->viaSocketFds($mgr);
+        $uid = null;
+        $gid = null;
+        $un = $this->unit->get("Service", "User", "");
+        if ($un != "" && $mgr->cfg->uid == 0) { $uid = execspec.resolveUid($mgr->sys, $un); $gid = $mgr->sys->userGid($un); if ($uid < 0) { $uid = null; } }
+        $this->runtimeDirs = execspec.prepareDirs($mgr->sys, $mgr->cfg, $this->unit, $uid, $gid);
+        return true;
+    }
+
+    func viaSocketFds($mgr) {
+        $r = $mgr->socketFdsFor($this->name());
+        $this->passFds = $r[0];
+        $this->passNames = $r[1];
+    }
+
+    # buduje spec i uruchamia; zwraca pid albo -errno (błąd zapisuje w failMsg)
+    func launch($mgr, $cmd, $isMain, $extraEnv) {
+        $x = ["cgroup" => $this->cgPath, "outFd" => $this->outW, "notifySock" => $this->notifyPath,
+              "isMain" => $isMain, "extraEnv" => $extraEnv, "fds" => [], "fdNames" => []];
+        if ($isMain || $this->svcType() == "oneshot") { $x["fds"] = $this->passFds; $x["fdNames"] = $this->passNames; }
+        $b = execspec.build($mgr->sys, $mgr->cfg, $this->unit, $cmd, $x);
+        if ($b["spec"] == null) { $this->failMsg = $b["error"]; return -1000; }
+        foreach ($b["ignored"] as $ig) {
+            if (!util.contains_item($this->ignoredNote, $ig)) {
+                $this->ignoredNote[] = $ig;
+                $this->log($mgr, 5, "Dyrektywa nieobsługiwana, pominięta: " . $ig);
+            }
+        }
+        $pid = $mgr->sys->spawn($b["spec"]);
+        if ($pid < 0) {
+            $this->failMsg = "Nie można uruchomić " . $cmd["path"] . " (etap " . $mgr->sys->spawnStage . "): " . $mgr->sys->errstr($pid);
+        }
+        return $pid;
+    }
+
+    func runPhase($mgr, $phase, $cmds) {
+        $this->phase = $phase;
+        $this->queue = $cmds;
+        $ms = $this->timeoutStart($mgr);
+        if ($phase == "stop-pre" || $phase == "stop-post") { $ms = $this->timeoutStop($mgr); }
+        if ($phase == "reload") { $ms = $this->timeoutStart($mgr); }
+        $this->deadlineIn($mgr, $ms);
+        $this->nextCommand($mgr);
+    }
+
+    func shift() {
+        $rest = [];
+        $i = 0;
+        foreach ($this->queue as $c) { if ($i > 0) { $rest[] = $c; } $i += 1; }
+        $this->queue = $rest;
+    }
+
+    func nextCommand($mgr) {
+        while (count($this->queue) > 0) {
+            $cmd = $this->queue[0];
+            $this->shift();
+            $env = [];
+            if ($this->mainPid > 0) { $env["MAINPID"] = strval($this->mainPid); }
+            if ($this->phase == "stop-post") {
+                $env["SERVICE_RESULT"] = $this->result;
+                $env["EXIT_STATUS"] = strval($this->mainStatus);
+            }
+            $pid = $this->launch($mgr, $cmd, false, $env);
+            if ($pid > 0) {
+                $this->controlPid = $pid;
+                $this->ctrlIgnore = $cmd["ignore"];
+                $mgr->addPid($pid, $this->name());
+                return 0;
+            }
+            if ($cmd["ignore"]) { continue; }
+            $this->commandFailed($mgr, "resources");
+            return 0;
+        }
+        $this->phaseDone($mgr);
+        return 0;
+    }
+
+    func commandFailed($mgr, $result) {
+        $this->log($mgr, 3, $this->failMsg != "" ? $this->failMsg : "Komenda zakończona niepowodzeniem");
+        if ($this->phase == "start-pre" || $this->phase == "start" || $this->phase == "start-post") { $this->abort($mgr, $result); return 0; }
+        if ($this->phase == "reload") { $this->returnToRunning($mgr); return 0; }
+        if ($this->result == "success") { $this->result = $result; }
+        $this->phaseDone($mgr);
+        return 0;
+    }
+
+    func phaseDone($mgr) {
+        $p = $this->phase;
+        if ($p == "start-pre") { $this->enterStart($mgr); }
+        elseif ($p == "start") {
+            # oneshot: wszystkie ExecStart wykonane
+            $this->runPhase($mgr, "start-post", $this->parseCmds("ExecStartPost", $this->baseEnv()));
+        }
+        elseif ($p == "start-post") { $this->afterStartPost($mgr); }
+        elseif ($p == "reload") { $this->returnToRunning($mgr); }
+        elseif ($p == "stop-pre") { $this->enterStopSigterm($mgr); }
+        elseif ($p == "stop-post") { $this->enterFinal($mgr); }
+        return 0;
+    }
+
+    func enterStart($mgr) {
+        $t = $this->svcType();
+        $cmds = $this->parseCmds("ExecStart", $this->baseEnv());
+        $this->setState($mgr, "activating", "start");
+        if ($t == "oneshot") {
+            if (count($cmds) == 0) { $this->phaseDone($mgr); return 0; }
+            $this->runPhase($mgr, "start", $cmds);
+            return 0;
+        }
+        if (count($cmds) == 0) {
+            $this->failMsg = "ExecStart= nie ustawiono";
+            $this->abort($mgr, "resources");
+            return 0;
+        }
+        $pid = $this->launch($mgr, $cmds[0], true, []);
+        if ($pid < 0) { $this->commandFailed($mgr, "resources"); return 0; }
+        $this->mainPid = $pid;
+        $mgr->addPid($pid, $this->name());
+        $this->phase = "start";
+        if ($t == "forking" || $t == "notify") { $this->deadlineIn($mgr, $this->timeoutStart($mgr)); }
+        else {
+            $this->deadline = -1;
+            $this->runPhase($mgr, "start-post", $this->parseCmds("ExecStartPost", $this->baseEnv()));
+        }
+        return 0;
+    }
+
+    func afterStartPost($mgr) {
+        $t = $this->svcType();
+        if ($t == "notify" && !$this->ready) { $this->phase = "start"; return 0; }
+        $this->enterRunning($mgr);
+        return 0;
+    }
+
+    func enterRunning($mgr) {
+        $this->deadline = -1;
+        $this->phase = "running";
+        $t = $this->svcType();
+        if ($t == "oneshot") {
+            if ($this->unit->getBool("Service", "RemainAfterExit", false)) {
+                $this->setState($mgr, "active", "exited");
+            } else {
+                $this->enterFinal($mgr);
+            }
+            return 0;
+        }
+        $this->startedReal = $mgr->sys->realMs();
+        $this->setState($mgr, "active", "running");
+        $this->armWatchdog($mgr);
+        if ($this->mainExited) { $this->handleMainExit($mgr, $this->mainStatus); }
+        return 0;
+    }
+
+    func armWatchdog($mgr) {
+        $w = $this->unit->getTimeMs("Service", "WatchdogSec", 0);
+        if ($w > 0) { $this->watchdogAt = $mgr->sys->monoMs() + $w; } else { $this->watchdogAt = -1; }
+    }
+
+    func returnToRunning($mgr) {
+        $this->deadline = -1;
+        $this->phase = "running";
+        $this->setState($mgr, "active", $this->mainPid > 0 || $this->svcType() == "oneshot" ? "running" : "exited");
+        return 0;
+    }
+
+    # ───────────── zdarzenia ─────────────
+
+    public func onExit($mgr, $pid, $status) {
+        if ($pid == $this->controlPid) {
+            $this->controlPid = 0;
+            $mgr->delPid($pid);
+            $this->handleControlExit($mgr, $status);
+        } elseif ($pid == $this->mainPid) {
+            $this->mainPid = 0;
+            $mgr->delPid($pid);
+            $this->handleMainExit($mgr, $status);
+        }
+        return 0;
+    }
+
+    func handleControlExit($mgr, $status) {
+        $ok = $this->successStatus($status) || $this->ctrlIgnore;
+        if (!$ok) {
+            $this->failMsg = "Proces sterujący zakończył się statusem " . $this->describeStatus($status);
+            $r = "exit-code";
+            if ($status >= 256) { $r = "signal"; }
+            $this->commandFailed($mgr, $r);
+            return 0;
+        }
+        $this->nextCommand($mgr);
+        return 0;
+    }
+
+    func describeStatus($s) {
+        if ($s >= 256) { return "sygnał " . $this->sigName(($s - 256) % 512); }
+        return "kod " . strval($s);
+    }
+
+    func handleMainExit($mgr, $status) {
+        $this->mainStatus = $status;
+        $this->mainStatusKnown = true;
+        $p = $this->phase;
+        if ($p == "start-pre" || $p == "start-post") {
+            # zakończył się, zanim zakończyła się faza startowa — rozstrzygniemy w enterRunning
+            if ($this->svcType() == "forking") { return 0; }
+            $this->mainExited = true;
+            return 0;
+        }
+        if ($p == "start") {
+            if ($this->svcType() == "forking") {
+                if (!$this->successStatus($status)) {
+                    $this->failMsg = "Proces główny zakończył się: " . $this->describeStatus($status);
+                    $this->abort($mgr, $this->classify($status));
+                    return 0;
+                }
+                $this->adoptForkedPid($mgr);
+                $this->runPhase($mgr, "start-post", $this->parseCmds("ExecStartPost", $this->baseEnv()));
+                return 0;
+            }
+            $this->failMsg = "Proces główny zakończył się przed gotowością: " . $this->describeStatus($status);
+            $this->abort($mgr, $this->classify($status) == "success" ? "protocol" : $this->classify($status));
+            return 0;
+        }
+        if ($p == "running" || $p == "reload") {
+            $cls = $this->classify($status);
+            if ($cls != "success") {
+                $this->failMsg = "Proces główny zakończył się: " . $this->describeStatus($status);
+                $this->log($mgr, 4, $this->failMsg);
+            }
+            if ($this->result == "success") { $this->result = $cls; }
+            $this->killRemaining($mgr);
+            $this->enterStopPost($mgr);
+            return 0;
+        }
+        if ($p == "stop-sigterm" || $p == "stop-sigkill" || $p == "stop-pre") {
+            if ($p != "stop-pre") { $this->checkGone($mgr); }
+            return 0;
+        }
+        return 0;
+    }
+
+    func adoptForkedPid($mgr) {
+        $pf = $this->unit->get("Service", "PIDFile", "");
+        $pid = 0;
+        if ($pf != "") {
+            $t = $mgr->sys->readFile($pf, 64);
+            if ($t != null) { $pid = util.parseInt(trim($t), 0); }
+        }
+        if ($pid <= 0 && $this->cgPath != "") {
+            $ps = $mgr->cg->pids($this->cgPath);
+            if (count($ps) > 0) { $pid = $ps[0]; }
+        }
+        if ($pid > 0) {
+            $this->mainPid = $pid;
+            $mgr->addPid($pid, $this->name());
+        }
+        return 0;
+    }
+
+    public func onNotify($mgr, $kv) {
+        $st = $kv["STATUS"] ?? null;
+        if ($st != null) { $this->statusText = $st; }
+        $mp = $kv["MAINPID"] ?? null;
+        if ($mp != null) {
+            $n = util.parseInt($mp, 0);
+            if ($n > 0) {
+                if ($this->mainPid > 0) { $mgr->delPid($this->mainPid); }
+                $this->mainPid = $n;
+                $mgr->addPid($n, $this->name());
+            }
+        }
+        if (($kv["WATCHDOG"] ?? "") == "1") { $this->armWatchdog($mgr); }
+        if (($kv["RELOADING"] ?? "") == "1" && $this->state == "active") { $this->setState($mgr, "active", "reload"); }
+        if (($kv["READY"] ?? "") == "1") {
+            $this->ready = true;
+            if ($this->phase == "start" && $this->svcType() == "notify") {
+                $this->runPhase($mgr, "start-post", $this->parseCmds("ExecStartPost", $this->baseEnv()));
+            } elseif ($this->sub == "reload") { $this->returnToRunning($mgr); }
+        }
+        return 0;
+    }
+
+    # dane z potoku logów lub gniazda notify
+    public func onFd($mgr, $fd, $flags, $kind) {
+        if ($kind == "log") {
+            $n = 0;
+            while ($n < 64) {
+                $d = $mgr->sys->read($fd, 65536);
+                if ($d == null) { $this->closeLog($mgr, false); break; }
+                if ($d == "") { break; }
+                $mgr->journal->feed($fd, $d, $this->name(), $this->mainPid > 0 ? $this->mainPid : $this->controlPid, 6, $this->unit->get("Service", "SyslogIdentifier", util.prefixOf($this->name())));
+                $n += 1;
+            }
+            return 0;
+        }
+        if ($kind == "notify") {
+            $n = 0;
+            while ($n < 32) {
+                $d = $mgr->sys->recv($fd);
+                if ($d == null || $d == "") { break; }
+                $this->onNotify($mgr, proto.parseNotify($d));
+                $n += 1;
+            }
+        }
+        return 0;
+    }
+
+    func closeLog($mgr, $final) {
+        if ($this->outR < 0) { return 0; }
+        $ident = $this->unit->get("Service", "SyslogIdentifier", util.prefixOf($this->name()));
+        if ($final) {
+            $n = 0;
+            while ($n < 256) {
+                $d = $mgr->sys->read($this->outR, 65536);
+                if ($d == null || $d == "") { break; }
+                $mgr->journal->feed($this->outR, $d, $this->name(), 0, 6, $ident);
+                $n += 1;
+            }
+        }
+        $mgr->journal->flush($this->outR, $this->name(), 0, 6, $ident);
+        $mgr->unwatch($this->outR);
+        $mgr->sys->close($this->outR);
+        $this->outR = -1;
+        if ($this->outW >= 0) { $mgr->sys->close($this->outW); $this->outW = -1; }
+        return 0;
+    }
+
+    # ───────────── zatrzymywanie ─────────────
+
+    func abort($mgr, $result) {
+        if ($this->result == "success") { $this->result = $result; }
+        if ($this->failMsg != "") { $this->log($mgr, 3, $this->failMsg); }
+        $this->killControl($mgr);
+        $this->setState($mgr, "deactivating", "stop-sigterm");
+        $this->enterStopSigterm($mgr);
+        return 0;
+    }
+
+    func killControl($mgr) {
+        if ($this->controlPid > 0) {
+            $mgr->sys->kill($this->controlPid, 9);
+            $mgr->sys->kill(0 - $this->controlPid, 9);
+        }
+        $this->queue = [];
+        return 0;
+    }
+
+    public func stop($mgr) {
+        if ($this->state == "inactive" || $this->state == "failed") { $this->pendingStart = false; return 0; }
+        $this->manualStop = true;
+        $this->pendingStart = false;
+        if ($this->phase == "auto-restart") {
+            $this->deadline = -1;
+            $this->phase = "dead";
+            $this->setState($mgr, "inactive", "dead");
+            return 0;
+        }
+        if ($this->state == "deactivating") { return 0; }
+        $p = $this->phase;
+        if ($p == "start-pre" || $p == "start-post" || $p == "reload" || $p == "start") {
+            $this->killControl($mgr);
+            $this->setState($mgr, "deactivating", "stop-sigterm");
+            $this->enterStopSigterm($mgr);
+            return 0;
+        }
+        $this->setState($mgr, "deactivating", "stop-pre");
+        $cmds = $this->parseCmds("ExecStop", $this->baseEnv());
+        if ($this->mainPid <= 0 && $this->sub != "exited") { $cmds = []; }
+        $this->runPhase($mgr, "stop-pre", $cmds);
+        return 0;
+    }
+
+    func killSignal() {
+        return util.sigNum($this->unit->get("Service", "KillSignal", "TERM"));
+    }
+
+    func sendSignals($mgr, $sig, $all) {
+        $mode = lower($this->unit->get("Service", "KillMode", "control-group"));
+        if ($mode == "none") { return 0; }
+        if ($this->mainPid > 0) { $mgr->sys->kill($this->mainPid, $sig); }
+        if ($this->controlPid > 0) { $mgr->sys->kill($this->controlPid, $sig); }
+        if ($mode == "process") { return 0; }
+        if ($mode == "mixed" && !$all) { return 0; }
+        if ($this->cgPath != "") { $mgr->cg->kill($this->cgPath, $sig); }
+        elseif ($this->mainPid > 0) { $mgr->sys->kill(0 - $this->mainPid, $sig); }
+        return 0;
+    }
+
+    func enterStopSigterm($mgr) {
+        $this->phase = "stop-sigterm";
+        $this->setState($mgr, "deactivating", "stop-sigterm");
+        $this->deadlineIn($mgr, $this->timeoutStop($mgr));
+        $sig = $this->killSignal();
+        $this->sendSignals($mgr, $sig, false);
+        if ($this->unit->getBool("Service", "SendSIGHUP", false)) { $this->sendSignals($mgr, 1, true); }
+        $this->checkGone($mgr);
+        return 0;
+    }
+
+    func isGone($mgr) {
+        if ($this->mainPid > 0 || $this->controlPid > 0) { return false; }
+        $mode = lower($this->unit->get("Service", "KillMode", "control-group"));
+        if ($mode == "none" || $mode == "process") { return true; }
+        if ($this->cgPath != "") { return $mgr->cg->empty($this->cgPath); }
+        return true;
+    }
+
+    func checkGone($mgr) {
+        if ($this->phase != "stop-sigterm" && $this->phase != "stop-sigkill") { return 0; }
+        if ($this->isGone($mgr)) {
+            $this->pollAt = -1;
+            $this->deadline = -1;
+            $this->enterStopPost($mgr);
+        } else { $this->pollAt = $mgr->sys->monoMs() + 50; }
+        return 0;
+    }
+
+    func killRemaining($mgr) {
+        $mode = lower($this->unit->get("Service", "KillMode", "control-group"));
+        if ($mode == "control-group" || $mode == "mixed") {
+            if ($this->cgPath != "" && !$mgr->cg->empty($this->cgPath)) { $mgr->cg->kill($this->cgPath, 15); }
+        }
+        return 0;
+    }
+
+    func enterStopPost($mgr) {
+        $this->watchdogAt = -1;
+        $this->setState($mgr, "deactivating", "stop-post");
+        $this->mainStatus = $this->mainStatusKnown ? $this->mainStatus : 0;
+        $this->runPhase($mgr, "stop-post", $this->parseCmds("ExecStopPost", $this->baseEnv()));
+        return 0;
+    }
+
+    # sprzątanie i wybór stanu końcowego
+    func enterFinal($mgr) {
+        $this->deadline = -1;
+        $this->pollAt = -1;
+        $this->watchdogAt = -1;
+        $this->killControl($mgr);
+        if ($this->cgPath != "") {
+            if (!$mgr->cg->empty($this->cgPath)) { $mgr->cg->kill($this->cgPath, 9); }
+            $this->closeLog($mgr, true);
+            $mgr->cg->remove($this->cgPath);
+            $this->cgPath = "";
+        } else { $this->closeLog($mgr, true); }
+        if ($this->notifyFd >= 0) {
+            $mgr->unwatch($this->notifyFd);
+            $mgr->sys->close($this->notifyFd);
+            $mgr->sys->unlink($this->notifyPath);
+            $this->notifyFd = -1;
+            $this->notifyPath = "";
+        }
+        if (!$this->unit->has("Service", "RuntimeDirectoryPreserve") || $this->unit->get("Service", "RuntimeDirectoryPreserve", "no") == "no") {
+            foreach ($this->runtimeDirs as $d) { $mgr->sys->rmdir($d); }
+        }
+        $this->runtimeDirs = [];
+        $this->phase = "dead";
+        $ok = $this->result == "success";
+        if ($ok) {
+            $this->setState($mgr, "inactive", "dead");
+        } else {
+            $this->setState($mgr, "failed", "failed");
+        }
+        if ($this->pendingStart) {
+            $this->pendingStart = false;
+            $this->start($mgr);
+            return 0;
+        }
+        if (!$this->manualStop && !$mgr->shuttingDown && $this->shouldRestart()) {
+            $this->scheduleRestart($mgr);
+        }
+        return 0;
+    }
+
+    func shouldRestart() {
+        $pol = lower($this->unit->get("Service", "Restart", "no"));
+        if ($pol == "no") { return false; }
+        $code = $this->mainStatusKnown ? $this->mainStatus : 0;
+        foreach ($this->unit->getList("Service", "RestartPreventExitStatus") as $w) { if ($w == strval($code)) { return false; } }
+        foreach ($this->unit->getList("Service", "RestartForceExitStatus") as $w) { if ($w == strval($code)) { return true; } }
+        $r = $this->result;
+        if ($pol == "always") { return true; }
+        if ($pol == "on-success") { return $r == "success"; }
+        if ($pol == "on-failure") { return $r != "success"; }
+        if ($pol == "on-abnormal") { return $r == "signal" || $r == "timeout" || $r == "watchdog"; }
+        if ($pol == "on-abort") { return $r == "signal"; }
+        if ($pol == "on-watchdog") { return $r == "watchdog"; }
+        return false;
+    }
+
+    func scheduleRestart($mgr) {
+        $this->restarts += 1;
+        $this->phase = "auto-restart";
+        $this->deadlineIn($mgr, $this->restartMs($mgr));
+        $this->log($mgr, 5, "Zaplanowano ponowne uruchomienie (#" . strval($this->restarts) . ")");
+        $this->setState($mgr, "activating", "auto-restart");
+        return 0;
+    }
+
+    # ───────────── reload ─────────────
+
+    public func reload($mgr) {
+        if ($this->state != "active") { return 0; }
+        $cmds = $this->parseCmds("ExecReload", $this->baseEnv());
+        if (count($cmds) == 0) { return 0; }
+        $this->setState($mgr, "active", "reload");
+        $this->runPhase($mgr, "reload", $cmds);
+        return 0;
+    }
+
+    # ───────────── czas ─────────────
+
+    public func nextWake() {
+        $w = -1;
+        foreach ([$this->deadline, $this->pollAt, $this->watchdogAt] as $t) {
+            if ($t >= 0 && ($w < 0 || $t < $w)) { $w = $t; }
+        }
+        return $w;
+    }
+
+    public func onTick($mgr, $now) {
+        if ($this->pollAt >= 0 && $now >= $this->pollAt) {
+            $this->pollAt = -1;
+            $this->checkGone($mgr);
+        }
+        if ($this->watchdogAt >= 0 && $now >= $this->watchdogAt && $this->state == "active") {
+            $this->watchdogAt = -1;
+            $this->failMsg = "Watchdog: brak sygnału życia w WatchdogSec";
+            $this->abort($mgr, "watchdog");
+            return 0;
+        }
+        if ($this->deadline >= 0 && $now >= $this->deadline) {
+            $this->deadline = -1;
+            $this->onTimeout($mgr);
+        }
+        return 0;
+    }
+
+    func onTimeout($mgr) {
+        $p = $this->phase;
+        if ($p == "auto-restart") {
+            $this->start($mgr);
+            return 0;
+        }
+        if ($p == "start-pre" || $p == "start" || $p == "start-post") {
+            $this->failMsg = "Przekroczono TimeoutStartSec w fazie " . $p;
+            $this->abort($mgr, "timeout");
+            return 0;
+        }
+        if ($p == "reload") {
+            $this->killControl($mgr);
+            $this->returnToRunning($mgr);
+            return 0;
+        }
+        if ($p == "stop-pre") { $this->killControl($mgr); $this->enterStopSigterm($mgr); return 0; }
+        if ($p == "stop-sigterm") {
+            if ($this->result == "success") { $this->result = "timeout"; }
+            if ($this->unit->getBool("Service", "SendSIGKILL", true)) {
+                $this->phase = "stop-sigkill";
+                $this->setState($mgr, "deactivating", "stop-sigkill");
+                $this->deadlineIn($mgr, $this->timeoutStop($mgr));
+                $this->sendSignals($mgr, 9, true);
+                $this->checkGone($mgr);
+            } else { $this->enterStopPost($mgr); }
+            return 0;
+        }
+        if ($p == "stop-sigkill") {
+            $this->log($mgr, 3, "Procesy nie reagują na SIGKILL — porzucam");
+            $this->mainPid = 0;
+            $this->enterStopPost($mgr);
+            return 0;
+        }
+        if ($p == "stop-post") {
+            $this->killControl($mgr);
+            $this->enterFinal($mgr);
+            return 0;
+        }
+        return 0;
+    }
+
+    public func mainPidValue() { return $this->mainPid; }
+
+    public func describe($mgr) {
+        $d = ["mainPid" => $this->mainPid, "controlPid" => $this->controlPid, "status" => $this->statusText,
+              "restarts" => $this->restarts, "cgroup" => $this->cgPath, "result" => $this->result, "failMsg" => $this->failMsg,
+              "phase" => $this->phase, "tasks" => 0, "memory" => -1, "conditionMsg" => $this->conditionMsg];
+        if ($this->cgPath != "") {
+            $d["tasks"] = count($mgr->cg->pids($this->cgPath));
+            $d["memory"] = $mgr->cg->memoryCurrent($this->cgPath);
+        }
+        return $d;
+    }
+}

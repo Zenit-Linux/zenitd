@@ -1,1 +1,37 @@
+[package]
+name = "zenitd"
+version = "0.1.0"
+kind = "bin"
+entry = "src/main.zsharp"
+description = "zenitd — init (PID 1) i menedżer usług dla Zenit Linux, napisany w całości w Z#. Następca systemd bez molocha."
+license = "MPL-2.0"
 
+# `import Workspace.<człon>;` — ścieżki względem tego pliku
+[workspace.members]
+mem       = "src/mem.zsharp"
+sys       = "src/sys.zsharp"
+util      = "src/util.zsharp"
+ini       = "src/ini.zsharp"
+unit      = "src/unit.zsharp"
+loader    = "src/loader.zsharp"
+graph     = "src/graph.zsharp"
+calendar  = "src/calendar.zsharp"
+journal   = "src/journal.zsharp"
+proto     = "src/proto.zsharp"
+config    = "src/config.zsharp"
+cgroup    = "src/cgroup.zsharp"
+execspec  = "src/execspec.zsharp"
+runtime   = "src/runtime.zsharp"
+service   = "src/service.zsharp"
+socket    = "src/socket.zsharp"
+timer     = "src/timer.zsharp"
+manager   = "src/manager.zsharp"
+boot      = "src/boot.zsharp"
+control   = "src/control.zsharp"
+ctl       = "src/ctl.zsharp"
+compat    = "src/compat.zsharp"
+
+# Biblioteka C (glibc albo musl) — jedyna rzecz spoza Z#. Dla obrazów statycznych: musl.
+[extern.c]
+kind = "dylib"
+link-args = ["-lc"]

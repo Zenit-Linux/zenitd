@@ -1,0 +1,165 @@
+namespace timer;
+import Workspace.util;
+import Workspace.runtime;
+import Workspace.calendar;
+
+class Timer extends Runtime {
+    public $nextMono = -1;          # kiedy najbliższe wyzwolenie (czas monotoniczny, ms)
+    public $nextReal = 0;           # to samo jako epoch ms (dla list-timers)
+    public $activeMono = 0;
+    public $lastTrigger = 0;        # epoch s
+    public $consumed = [];          # jednorazowe wyzwalacze, które już zadziałały
+    public $specs = [];
+    public $lastUnitActive = 0;     # mono ms ostatniej aktywacji usługi
+    public $lastUnitInactive = 0;
+    public $failMsg = "";
+
+    public func serviceName() {
+        $s = $this->unit->get("Timer", "Unit", "");
+        if ($s != "") { return $s; }
+        return util.unitStem($this->name()) . ".service";
+    }
+
+    func stampPath($mgr) { return $mgr->cfg->stateDir . "/timers/" . $this->name(); }
+
+    public func start($mgr) {
+        if ($this->state == "active") { return 0; }
+        $this->activeMono = $mgr->sys->monoMs();
+        $this->specs = [];
+        $this->consumed = [];
+        foreach ($this->unit->getAll("Timer", "OnCalendar") as $e) {
+            $sp = calendar.parse($e);
+            if ($sp == null) {
+                $this->failMsg = "Niepoprawne OnCalendar=" . $e;
+                $this->result = "resources";
+                $mgr->log(3, $this->name(), $this->failMsg);
+                $this->setState($mgr, "failed", "failed");
+                return 0;
+            }
+            $this->specs[] = $sp;
+        }
+        $has = count($this->specs) > 0;
+        foreach (["OnBootSec", "OnStartupSec", "OnActiveSec", "OnUnitActiveSec", "OnUnitInactiveSec"] as $k) {
+            if ($this->unit->has("Timer", $k)) { $has = true; }
+        }
+        if (!$has) {
+            $this->failMsg = "Brak wyzwalaczy w sekcji [Timer]";
+            $this->result = "resources";
+            $this->setState($mgr, "failed", "failed");
+            return 0;
+        }
+        $this->lastTrigger = 0;
+        if ($this->unit->getBool("Timer", "Persistent", false)) {
+            $t = $mgr->sys->readFile($this->stampPath($mgr), 64);
+            if ($t != null) { $this->lastTrigger = util.parseInt(trim($t), 0); }
+        }
+        $this->recompute($mgr, true);
+        $this->setState($mgr, "active", "waiting");
+        return 0;
+    }
+
+    public func stop($mgr) {
+        if ($this->state == "inactive" || $this->state == "failed") { return 0; }
+        $this->nextMono = -1;
+        $this->setState($mgr, "inactive", "dead");
+        return 0;
+    }
+
+    func addCandidate($best, $t) {
+        if ($t < 0) { return $best; }
+        if ($best < 0 || $t < $best) { return $t; }
+        return $best;
+    }
+
+    # wyznacza najbliższy moment wyzwolenia; $initial=true przy starcie jednostki
+    func recompute($mgr, $initial) {
+        $now = $mgr->sys->monoMs();
+        $realNow = intval($mgr->sys->realMs() / 1000);
+        $best = -1;
+        foreach (["OnBootSec", "OnStartupSec"] as $k) {
+            if (($this->consumed[$k] ?? false) == true) { continue; }
+            foreach ($this->unit->getAll("Timer", $k) as $v) {
+                $d = util.parseTimeMs($v);
+                if ($d != null && $d >= 0) { $best = $this->addCandidate($best, $mgr->bootMono + $d); }
+            }
+        }
+        if (($this->consumed["OnActiveSec"] ?? false) != true) {
+            foreach ($this->unit->getAll("Timer", "OnActiveSec") as $v) {
+                $d = util.parseTimeMs($v);
+                if ($d != null && $d >= 0) { $best = $this->addCandidate($best, $this->activeMono + $d); }
+            }
+        }
+        foreach ($this->unit->getAll("Timer", "OnUnitActiveSec") as $v) {
+            $d = util.parseTimeMs($v);
+            if ($d != null && $d >= 0) {
+                $base = $this->lastUnitActive > 0 ? $this->lastUnitActive : $this->activeMono;
+                $best = $this->addCandidate($best, $base + $d);
+            }
+        }
+        foreach ($this->unit->getAll("Timer", "OnUnitInactiveSec") as $v) {
+            $d = util.parseTimeMs($v);
+            if ($d != null && $d >= 0) {
+                $base = $this->lastUnitInactive > 0 ? $this->lastUnitInactive : $this->activeMono;
+                $best = $this->addCandidate($best, $base + $d);
+            }
+        }
+        foreach ($this->specs as $sp) {
+            $after = $realNow;
+            $missed = false;
+            if ($initial && $this->lastTrigger > 0) {
+                $n0 = calendar.next($sp, $this->lastTrigger, $mgr->sys);
+                if ($n0 > 0 && $n0 <= $realNow) { $missed = true; }
+            }
+            if ($missed) { $best = $this->addCandidate($best, $now); }
+            else {
+                $n = calendar.next($sp, $after, $mgr->sys);
+                if ($n > 0) { $best = $this->addCandidate($best, $now + ($n - $realNow) * 1000); }
+            }
+        }
+        $this->nextMono = $best;
+        if ($best >= 0) { $this->nextReal = $mgr->sys->realMs() + ($best - $now); } else { $this->nextReal = 0; }
+        return 0;
+    }
+
+    public func nextWake() {
+        if ($this->state != "active") { return -1; }
+        return $this->nextMono;
+    }
+
+    public func onTick($mgr, $now) {
+        if ($this->state != "active" || $this->nextMono < 0 || $now < $this->nextMono) { return 0; }
+        foreach (["OnBootSec", "OnStartupSec", "OnActiveSec"] as $k) {
+            if ($this->unit->has("Timer", $k)) {
+                $d = util.parseTimeMs($this->unit->get("Timer", $k, "0"));
+                $due = $k == "OnActiveSec" ? $this->activeMono + $d : $mgr->bootMono + $d;
+                if ($d != null && $due <= $now) { $this->consumed[$k] = true; }
+            }
+        }
+        $this->lastTrigger = intval($mgr->sys->realMs() / 1000);
+        if ($this->unit->getBool("Timer", "Persistent", false)) {
+            $mgr->sys->mkdirp($mgr->cfg->stateDir . "/timers", 493);
+            $mgr->sys->writeFile($this->stampPath($mgr), strval($this->lastTrigger), true);
+        }
+        $svc = $this->serviceName();
+        $rt = $mgr->runtimeFor($svc);
+        if ($rt == null || !$rt->isRunning()) {
+            $mgr->enqueueStart($svc, "wyzwolone przez " . $this->name());
+        }
+        # zapobiega pętli przy wyzwalaczach względem usługi, która jeszcze nie wystartowała
+        $this->lastUnitActive = $now;
+        $this->recompute($mgr, false);
+        if ($this->nextMono >= 0 && $this->nextMono <= $now) { $this->nextMono = $now + 1000; }
+        return 0;
+    }
+
+    public func serviceStateChanged($mgr, $svcRt) {
+        if ($svcRt->state == "active") { $this->lastUnitActive = $mgr->sys->monoMs(); }
+        if ($svcRt->state == "inactive" || $svcRt->state == "failed") { $this->lastUnitInactive = $mgr->sys->monoMs(); }
+        if ($this->state == "active") { $this->recompute($mgr, false); }
+        return 0;
+    }
+
+    public func describe($mgr) {
+        return ["service" => $this->serviceName(), "nextReal" => $this->nextReal, "last" => $this->lastTrigger, "failMsg" => $this->failMsg];
+    }
+}

@@ -1,0 +1,194 @@
+namespace unit;
+import Workspace.util;
+import Workspace.ini;
+
+class Unit {
+    public $name = "";
+    public $type = "";
+    public $path = "";             # plik główny (pusty dla jednostek tymczasowych)
+    public $dropins = [];
+    public $masked = false;
+    public $loadError = "";
+    public $sec = [];
+    public $warnings = [];
+    public $description = "";
+    public $requires = [];
+    public $wants = [];
+    public $requisite = [];
+    public $bindsTo = [];
+    public $partOf = [];
+    public $conflicts = [];
+    public $after = [];
+    public $before = [];
+    public $onFailure = [];
+    public $wantedBy = [];
+    public $requiredBy = [];
+    public $aliases = [];
+    public $defaultDeps = true;
+
+    public func __construct($name) {
+        $this->name = $name;
+        $this->type = util.unitType($name);
+    }
+
+    public func has($section, $key) {
+        $s = $this->sec[$section] ?? null;
+        if ($s == null) { return false; }
+        $v = $s[$key] ?? null;
+        return $v != null && count($v) > 0;
+    }
+
+    # ostatnia wartość klucza albo $def
+    public func get($section, $key, $def) {
+        $s = $this->sec[$section] ?? null;
+        if ($s == null) { return $def; }
+        $v = $s[$key] ?? null;
+        if ($v == null || count($v) == 0) { return $def; }
+        return $v[count($v) - 1];
+    }
+
+    public func getAll($section, $key) {
+        $s = $this->sec[$section] ?? null;
+        if ($s == null) { return []; }
+        return $s[$key] ?? [];
+    }
+
+    # wszystkie wartości rozbite na słowa (After=a b + After=c => [a,b,c])
+    public func getList($section, $key) {
+        $out = [];
+        foreach ($this->getAll($section, $key) as $v) {
+            foreach (util.splitList($v) as $w) { $out[] = $w; }
+        }
+        return $out;
+    }
+
+    public func getBool($section, $key, $def) {
+        $v = $this->get($section, $key, null);
+        if ($v == null) { return $def; }
+        return util.parseBool($v, $def);
+    }
+
+    # milisekundy, -1 = infinity, $def gdy brak/niepoprawne
+    public func getTimeMs($section, $key, $def) {
+        $v = $this->get($section, $key, null);
+        if ($v == null) { return $def; }
+        $r = util.parseTimeMs($v);
+        if ($r == null) { return $def; }
+        return $r;
+    }
+
+    public func getInt($section, $key, $def) {
+        $v = $this->get($section, $key, null);
+        if ($v == null) { return $def; }
+        return util.parseInt($v, $def);
+    }
+
+    public func setValue($section, $key, $value) {
+        $s = $this->sec[$section] ?? [];
+        $s[$key] = [$value];
+        $this->sec[$section] = $s;
+    }
+}
+
+# znane klucze (ostrzeżenia o literówkach; nieznane klucze nie przerywają ładowania)
+func knownKeys($section) {
+    if ($section == "Unit") {
+        return "Description Documentation Requires Requisite Wants BindsTo PartOf Upholds Conflicts Before After OnFailure OnSuccess PropagatesReloadTo ConditionPathExists ConditionPathExistsGlob ConditionPathIsDirectory ConditionPathIsMountPoint ConditionFileNotEmpty ConditionDirectoryNotEmpty ConditionFileIsExecutable ConditionVirtualization ConditionKernelCommandLine ConditionHost ConditionUser ConditionGroup ConditionSecurity ConditionACPower ConditionCapability ConditionFirstBoot ConditionNeedsUpdate ConditionControlGroupController ConditionArchitecture ConditionEnvironment ConditionPathIsSymbolicLink ConditionPathIsReadWrite ConditionMemory ConditionCPUs ConditionOSRelease ConditionKernelVersion ConditionFirmware ConditionCredential AssertPathExists AssertFileNotEmpty AssertVirtualization AssertKernelCommandLine DefaultDependencies RefuseManualStart RefuseManualStop AllowIsolate StopWhenUnneeded IgnoreOnIsolate JobTimeoutSec JobRunningTimeoutSec StartLimitIntervalSec StartLimitBurst StartLimitAction FailureAction SuccessAction RebootArgument SourcePath CollectMode JoinsNamespaceOf RequiresMountsFor Wants";
+    }
+    if ($section == "Install") { return "Alias WantedBy RequiredBy UpheldBy Also DefaultInstance"; }
+    if ($section == "Service") {
+        return "Type ExecStart ExecStartPre ExecStartPost ExecReload ExecStop ExecStopPost ExecCondition Restart RestartSec RestartSteps RestartMaxDelaySec RestartPreventExitStatus RestartForceExitStatus SuccessExitStatus RemainAfterExit PIDFile BusName NotifyAccess WatchdogSec TimeoutSec TimeoutStartSec TimeoutStopSec TimeoutAbortSec TimeoutStartFailureMode TimeoutStopFailureMode RuntimeMaxSec KillMode KillSignal RestartKillSignal SendSIGKILL SendSIGHUP FinalKillSignal User Group SupplementaryGroups DynamicUser WorkingDirectory RootDirectory Environment EnvironmentFile PassEnvironment UnsetEnvironment UMask Nice IOSchedulingClass IOSchedulingPriority CPUSchedulingPolicy CPUSchedulingPriority OOMScoreAdjust StandardInput StandardOutput StandardError TTYPath TTYReset TTYVHangup TTYVTDisallocate SyslogIdentifier SyslogFacility SyslogLevel LogLevelMax LimitNOFILE LimitNPROC LimitCORE LimitMEMLOCK LimitAS LimitCPU LimitFSIZE LimitDATA LimitSTACK LimitRSS LimitNICE LimitRTPRIO LimitSIGPENDING LimitMSGQUEUE LimitLOCKS LimitRTTIME LimitRSS NoNewPrivileges PrivateTmp PrivateNetwork PrivateDevices PrivateUsers PrivateMounts ProtectSystem ProtectHome ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups ProtectClock ProtectHostname ProtectProc ProcSubset ReadOnlyPaths ReadWritePaths InaccessiblePaths ReadOnlyDirectories ReadWriteDirectories InaccessibleDirectories BindPaths BindReadOnlyPaths TemporaryFileSystem CapabilityBoundingSet AmbientCapabilities SecureBits RestrictAddressFamilies RestrictNamespaces RestrictRealtime RestrictSUIDSGID RestrictFileSystems LockPersonality MemoryDenyWriteExecute SystemCallFilter SystemCallArchitectures SystemCallErrorNumber SystemCallLog MemoryMax MemoryHigh MemoryLow MemorySwapMax MemoryMin CPUWeight CPUQuota CPUQuotaPeriodSec CPUAffinity StartupCPUWeight IOWeight IODeviceWeight TasksMax Delegate Slice DevicePolicy DeviceAllow IPAddressAllow IPAddressDeny AllowedCPUs CPUAccounting MemoryAccounting TasksAccounting IOAccounting BlockIOAccounting StateDirectory RuntimeDirectory CacheDirectory LogsDirectory ConfigurationDirectory StateDirectoryMode RuntimeDirectoryMode CacheDirectoryMode LogsDirectoryMode ConfigurationDirectoryMode RuntimeDirectoryPreserve ExecPaths NoExecPaths UtmpIdentifier UtmpMode PAMName FileDescriptorStoreMax FileDescriptorStorePreserve OpenFile LoadCredential SetCredential Personality ExitType OOMPolicy CoredumpFilter KeyringMode NetworkNamespacePath UMask MountAPIVFS ProtectSystem DelegateSubgroup NotifyAccess ImportCredential LogExtraFields LogRateLimitIntervalSec LogRateLimitBurst LogNamespace MountFlags MemoryKSM";
+    }
+    if ($section == "Socket") {
+        return "ListenStream ListenDatagram ListenSequentialPacket ListenFIFO ListenSpecial ListenNetlink ListenMessageQueue ListenUSBFunction Accept MaxConnections MaxConnectionsPerSource Backlog BindIPv6Only BindToDevice SocketUser SocketGroup SocketMode DirectoryMode Service Writable KeepAlive KeepAliveTimeSec KeepAliveIntervalSec KeepAliveProbes NoDelay Priority ReceiveBuffer SendBuffer IPTOS IPTTL Mark ReusePort SmackLabel Symlinks FileDescriptorName TriggerLimitIntervalSec TriggerLimitBurst PassCredentials PassSecurity PassPacketInfo Timestamping TCPCongestion ExecStartPre ExecStartPost ExecStopPre ExecStopPost TimeoutSec RemoveOnStop FreeBind Transparent Broadcast PipeSize MessageQueueMaxMessages MessageQueueMessageSize SELinuxContextFromNet DeferTrigger DeferTriggerMaxSec PollLimitIntervalSec PollLimitBurst";
+    }
+    if ($section == "Timer") {
+        return "OnActiveSec OnBootSec OnStartupSec OnUnitActiveSec OnUnitInactiveSec OnCalendar AccuracySec RandomizedDelaySec FixedRandomDelay OnClockChange OnTimezoneChange Unit Persistent WakeSystem RemainAfterElapse";
+    }
+    return null;
+}
+
+func isKnown($section, $key) {
+    $k = knownKeys($section);
+    if ($k == null) { return true; }
+    if (starts_with($key, "X-")) { return true; }
+    foreach (split($k, " ") as $w) { if ($w == $key) { return true; } }
+    return false;
+}
+
+func addDeps($list, $values, $ctx) {
+    foreach ($values as $v) {
+        foreach (util.splitList(util.specifiers($v, $ctx)) as $w) {
+            $list = util.add_unique($list, util.normalizeName($w));
+        }
+    }
+    return $list;
+}
+
+# Buduje Unit z listy sekcji INI (plik główny + drop-iny, już połączone w kolejności).
+# $ctx: kontekst specyfikatorów (user, home, host...). $sections: wynik ini.parse()["sections"]
+func build($name, $sections, $path, $ctx) {
+    $u = new Unit($name);
+    $u->path = $path;
+    $ctx["name"] = $name;
+    $sec = [];
+    foreach ($sections as $s) {
+        $sn = $s["name"];
+        $cur = $sec[$sn] ?? [];
+        foreach ($s["items"] as $it) {
+            $key = $it[0];
+            $val = $it[1];
+            if (!isKnown($sn, $key)) {
+                $u->warnings[] = "nieznana dyrektywa " . $sn . "/" . $key . " (linia " . strval($it[2]) . ")";
+            }
+            $list = $cur[$key] ?? [];
+            if ($val == "") { $list = []; }
+            else { $list[] = util.specifiers($val, $ctx); }
+            $cur[$key] = $list;
+        }
+        $sec[$sn] = $cur;
+    }
+    $u->sec = $sec;
+    $u->description = $u->get("Unit", "Description", $name);
+    $u->defaultDeps = $u->getBool("Unit", "DefaultDependencies", true);
+    $u->requires = addDeps([], $u->getAll("Unit", "Requires"), $ctx);
+    $u->wants = addDeps([], $u->getAll("Unit", "Wants"), $ctx);
+    $u->requisite = addDeps([], $u->getAll("Unit", "Requisite"), $ctx);
+    $u->bindsTo = addDeps([], $u->getAll("Unit", "BindsTo"), $ctx);
+    $u->partOf = addDeps([], $u->getAll("Unit", "PartOf"), $ctx);
+    $u->conflicts = addDeps([], $u->getAll("Unit", "Conflicts"), $ctx);
+    $u->after = addDeps([], $u->getAll("Unit", "After"), $ctx);
+    $u->before = addDeps([], $u->getAll("Unit", "Before"), $ctx);
+    $u->onFailure = addDeps([], $u->getAll("Unit", "OnFailure"), $ctx);
+    $u->wantedBy = addDeps([], $u->getAll("Install", "WantedBy"), $ctx);
+    $u->requiredBy = addDeps([], $u->getAll("Install", "RequiredBy"), $ctx);
+    $u->aliases = addDeps([], $u->getAll("Install", "Alias"), $ctx);
+    # BindsTo i Requisite implikują porządek względem zależności tylko przez After= — jak w systemd
+    return $u;
+}
+
+# Zależności domyślne (DefaultDependencies=yes), wołane po zbudowaniu jednostki
+func applyDefaults($u) {
+    if (!$u->defaultDeps) { return; }
+    if ($u->type == "service" || $u->type == "socket" || $u->type == "timer") {
+        if ($u->name != "basic.target" && !util.contains_item(["sysinit.target", "emergency.service", "rescue.service"], $u->name)) {
+            $u->after = util.add_unique($u->after, "basic.target");
+        }
+        $u->before = util.add_unique($u->before, "shutdown.target");
+        $u->conflicts = util.add_unique($u->conflicts, "shutdown.target");
+    }
+    if ($u->type == "socket") { $u->after = util.add_unique($u->after, "sockets.target"); }
+    if ($u->type == "target") {
+        $u->before = util.add_unique($u->before, "shutdown.target");
+        $u->conflicts = util.add_unique($u->conflicts, "shutdown.target");
+        if ($u->name == "shutdown.target") {
+            $u->conflicts = [];
+            $u->before = [];
+        }
+    }
+    # cel porządkuje się po swoich zależnościach (jak w systemd)
+    if ($u->type == "target") {
+        foreach ($u->requires as $d) { $u->after = util.add_unique($u->after, $d); }
+        foreach ($u->wants as $d) { $u->after = util.add_unique($u->after, $d); }
+    }
+}

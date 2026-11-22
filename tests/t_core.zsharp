@@ -1,0 +1,104 @@
+import Workspace.sys;
+import Workspace.util;
+import Workspace.loader;
+import Workspace.graph;
+import Workspace.calendar;
+
+func eq($name, $got, $want) {
+    if ($got == $want) { echo "ok   " . $name; return 0; }
+    echo "FAIL " . $name . " got=" . strval($got) . " want=" . strval($want);
+    return 1;
+}
+
+class Reg {
+    public $ld;
+    public $all = [];
+    public func __construct($ld) { $this->ld = $ld; }
+    public func unit($n) { $u = $this->ld->load($n); if (!util.contains_item($this->all, $u)) { $this->all[] = $u; } return $u; }
+    public func loadedUnits() { return $this->all; }
+}
+
+$f = 0;
+$s = new Sys();
+$s->addFile("/usr/lib/zenit/system/basic.target", "[Unit]\nDescription=Basic\n");
+$s->addFile("/usr/lib/zenit/system/shutdown.target", "[Unit]\nDescription=Shutdown\n");
+$s->addFile("/usr/lib/zenit/system/multi-user.target", "[Unit]\nDescription=Multi\nRequires=basic.target\nWants=a.service\n");
+$s->addFile("/usr/lib/zenit/system/a.service", "[Unit]\nDescription=A\nAfter=b.service\nWants=b.service\n[Service]\nExecStart=/bin/a\nUser=%i\n[Install]\nWantedBy=multi-user.target\n");
+$s->addFile("/usr/lib/zenit/system/b.service", "[Unit]\nRequires=c.service\nAfter=c.service\n[Service]\nExecStart=/bin/b\n");
+$s->addFile("/usr/lib/zenit/system/c.service", "[Unit]\nAfter=a.service\n[Service]\nExecStart=/bin/c\n");
+$s->addFile("/usr/lib/zenit/system/getty@.service", "[Service]\nExecStart=/sbin/agetty %I\n[Install]\nDefaultInstance=tty1\nWantedBy=multi-user.target\n");
+$s->addFile("/usr/lib/zenit/system/a.service.d/10-over.conf", "[Service]\nExecStart=\nExecStart=/bin/a2\nEnvironment=X=1\n");
+$s->addFile("/etc/zenit/system/a.service.d/20-more.conf", "[Service]\nEnvironment=Y=2\n");
+$s->addFile("/usr/lib/zenit/system/x.service", "[Service]\nExecStart=/bin/x\nBogusKey=1\n");
+$s->symlink("/dev/null", "/etc/zenit/system/x.service");
+
+$ld = new Loader($s, ["/etc/zenit/system", "/usr/lib/zenit/system"], "/etc/zenit/system", ["user" => "root"]);
+$a = $ld->load("a.service");
+$f += eq("load desc", $a->description, "A");
+$f += eq("dropin reset+override", join($a->getAll("Service", "ExecStart"), "|"), "/bin/a2");
+$f += eq("dropin env", count($a->getAll("Service", "Environment")), 2);
+$f += eq("deps After", join($a->after, ","), "b.service,basic.target");
+$f += eq("default conflicts", join($a->conflicts, ","), "shutdown.target");
+$f += eq("masked", $ld->load("x.service")->masked, true);
+$f += eq("not found", $ld->load("nope.service")->loadError, "not-found");
+$g = $ld->load("getty@tty2.service");
+$f += eq("template exec", $g->getAll("Service", "ExecStart")[0], "/sbin/agetty tty2");
+$f += eq("enableState disabled", $ld->enableState("a.service"), "disabled");
+$f += eq("enableState static", $ld->enableState("b.service"), "static");
+$f += eq("enableState masked", $ld->enableState("x.service"), "masked");
+$m = $ld->enable("a.service");
+$f += eq("enable msg", count($m), 1);
+$f += eq("enable link", $s->readlink("/etc/zenit/system/multi-user.target.wants/a.service"), "/usr/lib/zenit/system/a.service");
+$f += eq("enableState enabled", $ld->enableState("a.service"), "enabled");
+$ld->clearCache();
+$mu = $ld->load("multi-user.target");
+$f += eq("wants from dir", util.contains_item($mu->wants, "a.service"), true);
+$f += eq("enable template needs default", count($ld->enable("getty@.service")), 1);
+$ld->disable("a.service");
+$f += eq("disable", $s->stat("/etc/zenit/system/multi-user.target.wants/a.service"), 0);
+$ld->unmask("x.service");
+$f += eq("unmask", $s->stat("/etc/zenit/system/x.service"), 0);
+$ld->mask("b.service");
+$f += eq("mask", $ld->enableState("b.service"), "masked");
+$ld->unmask("b.service");
+$f += eq("list files", count($ld->listFiles()) >= 6, true);
+$f += eq("warnings unknown key", count($ld->load("x.service")->warnings), 1);
+
+# graf
+$ld->clearCache();
+$reg = new Reg($ld);
+$p = graph.planStart($reg, "multi-user.target");
+$f += eq("plan no errors", count($p["errors"]), 0);
+$f += eq("plan members", count($p["start"]), 6);
+$pos = [];
+$i = 0;
+foreach ($p["start"] as $n) { $pos[$n] = $i; $i += 1; }
+$f += eq("order basic first", $pos["basic.target"] < $pos["multi-user.target"], true);
+$f += eq("order target last-ish", $pos["a.service"] < $pos["multi-user.target"], true);
+$f += eq("cycle warning", count($p["warnings"]) > 0, true);
+$p2 = graph.planStart($reg, "nope.service");
+$f += eq("missing root error", count($p2["errors"]), 1);
+$sc = graph.stopClosure($reg, "c.service");
+$f += eq("stop closure", util.contains_item($sc, "b.service"), true);
+$t = graph.tree($reg, "multi-user.target", 3);
+$f += eq("tree", count($t) >= 3, true);
+
+# kalendarz
+$sp = calendar.parse("daily");
+$base = $s->mktime(2026, 11, 21, 13, 45, 7);
+$nx = calendar.next($sp, $base, $s);
+$f += eq("daily next", $nx, $s->mktime(2026, 11, 22, 0, 0, 0));
+$sp = calendar.parse("*-*-* 03:30");
+$f += eq("time next", calendar.next($sp, $base, $s), $s->mktime(2026, 11, 22, 3, 30, 0));
+$sp = calendar.parse("Mon,Fri *-*-* 12:00:00");
+$nx = calendar.next($sp, $base, $s);
+$f += eq("dow next (21.11.2026 = sobota -> pon 23)", $s->tm($nx)[2], 23);
+$sp = calendar.parse("hourly");
+$f += eq("hourly", calendar.next($sp, $base, $s), $s->mktime(2026, 11, 21, 14, 0, 0));
+$sp = calendar.parse("*:0/15");
+$f += eq("every 15 min", calendar.next($sp, $base, $s), $s->mktime(2026, 11, 21, 14, 0, 0));
+$sp = calendar.parse("monthly");
+$f += eq("monthly", calendar.next($sp, $base, $s), $s->mktime(2026, 12, 1, 0, 0, 0));
+$f += eq("bad expr", calendar.parse("co sie dzieje"), null);
+$f += eq("fake tm weekday sat", $s->tm($base)[6], 6);
+exit($f);

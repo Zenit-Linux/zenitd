@@ -1,0 +1,204 @@
+import Workspace.sys;
+import Workspace.util;
+import Workspace.config;
+import Workspace.manager;
+import Workspace.journal;
+import Workspace.proto;
+import Workspace.ctl;
+import Workspace.compat;
+
+func eq($name, $got, $want) {
+    if ($got == $want) { echo "ok   " . $name; return 0; }
+    echo "FAIL " . $name . " got=" . strval($got) . " want=" . strval($want);
+    return 1;
+}
+func pump($m, $n) { $i = 0; while ($i < $n) { $m->iterate(0); $i += 1; } }
+func mk($s, $pid) {
+    $s->pidVal = $pid;
+    $cfg = config.load($s, "system", ["HOME" => "/root"]);
+    $m = new Manager($s, $cfg);
+    $m->setup();
+    return $m;
+}
+
+$f = 0;
+
+# ── journal ──
+$s = new Sys();
+$j = new Journal($s, ["/run/log/zenit"], 300, 2);
+$j->feed(5, "linia1\nlin", "a.service", 10, 6, "a");
+$j->feed(5, "ia2\n", "a.service", 10, 6, "a");
+$j->write("b.service", 11, 3, "b", "tab\there");
+$e = journal.readEntries($s, "/run/log/zenit", 2);
+$f += eq("journal count", count($e), 3);
+$f += eq("journal joined partial", $e[1][5], "linia2");
+$f += eq("journal escape roundtrip", $e[2][5], "tab\there");
+$f += eq("filter unit", count(journal.filter($e, "a.service", 7, 0, "")), 2);
+$f += eq("filter prio", count(journal.filter($e, "", 3, 0, "")), 1);
+$f += eq("filter grep", count(journal.filter($e, "", 7, 0, "linia2")), 1);
+$f += eq("tail", count(journal.tail($e, 2)), 2);
+$i = 0;
+while ($i < 10) { $j->write("c.service", 1, 6, "c", "wypelniacz-wypelniacz-wypelniacz"); $i += 1; }
+$f += eq("rotation created .1", $s->exists("/run/log/zenit/zenit.log.1"), true);
+$f += eq("rotation capped", $s->exists("/run/log/zenit/zenit.log.3"), false);
+$p = journal.parseSyslog("<30>Nov 21 13:45:07 sshd[812]: Accepted key");
+$f += eq("syslog prio", $p["prio"], 6);
+$f += eq("syslog ident", $p["ident"], "sshd");
+$f += eq("syslog pid", $p["pid"], 812);
+$f += eq("syslog msg", $p["msg"], "Accepted key");
+$p = journal.parseSyslog("<11>cron: boom");
+$f += eq("syslog no ts", $p["ident"] . ":" . $p["msg"] . ":" . $p["prio"], "cron:boom:3");
+$f += eq("fmtShort", contains(journal.fmtShort([1798000000000, "a", 5, 6, "a", "hi"], $s, "h"), "a[5]: hi"), true);
+
+# ── proto ──
+$rb = new ReqBuf();
+$l = $rb->feed("start\ta.service\nstop\tb");
+$f += eq("reqbuf first", count($l), 1);
+$l = $rb->feed(".service\n");
+$f += eq("reqbuf second", $l[0], "stop\tb.service");
+$enc = proto.encodeRequest(["x", "a\tb", "c\nd"]);
+$f += eq("proto roundtrip", join(proto.decodeRequest(substr($enc, 0, strlen($enc) - 1)), "|"), "x|a\tb|c\nd");
+$f += eq("notify parse", proto.parseNotify("READY=1\nSTATUS=ok=fine\n")["STATUS"], "ok=fine");
+$f += eq("response encode", proto.encodeResponse(3, "abc"), "3\t3\nabc");
+
+# ── socket activation ──
+$s = new Sys();
+$u = "/usr/lib/zenit/system/";
+foreach (["basic", "shutdown", "sockets"] as $t) { $s->addFile($u . $t . ".target", "[Unit]\n"); }
+$s->addFile($u . "echo.socket", "[Socket]\nListenStream=/run/echo.sock\nSocketMode=0660\n");
+$s->addFile($u . "echo.service", "[Service]\nExecStart=/bin/echod\n");
+$s->addFile($u . "acc.socket", "[Socket]\nListenStream=9999\nAccept=yes\n");
+$s->addFile($u . "tcp.socket", "[Socket]\nListenStream=127.0.0.1:8080\n");
+$m = mk($s, 4242);
+$m->submit("echo.socket", "start", "manual");
+pump($m, 1);
+$sock = $m->runtimeFor("echo.socket");
+$f += eq("socket listening", $sock->state . "/" . $sock->sub, "active/listening");
+$f += eq("service not started yet", $m->runtimeFor("echo.service"), null);
+$sock->onFd($m, $sock->fds[0], 1, "sock");
+pump($m, 2);
+$svc = $m->runtimeFor("echo.service");
+$f += eq("activated service active", $svc->state, "active");
+$sp = $s->lastSpawn();
+$f += eq("passes 1 fd", count($sp["fds"]), 1);
+$f += eq("LISTEN_FDS env", util.contains_item($sp["env"], "LISTEN_FDS=1"), true);
+$f += eq("LISTEN_PID slot", $sp["listenPidSlot"] >= 0, true);
+$f += eq("socket paused while active", $sock->triggered, true);
+$m->submit("echo.service", "stop", "manual");
+pump($m, 4);
+$f += eq("socket resumed after stop", $sock->triggered, false);
+$m->submit("acc.socket", "start", "manual");
+pump($m, 1);
+$f += eq("Accept=yes rejected", $m->runtimeFor("acc.socket")->state, "failed");
+$m->submit("tcp.socket", "start", "manual");
+pump($m, 1);
+$f += eq("tcp socket active", $m->runtimeFor("tcp.socket")->state, "active");
+$m->submit("echo.socket", "stop", "manual");
+pump($m, 2);
+$f += eq("socket stopped", $m->runtimeFor("echo.socket")->state, "inactive");
+
+# ── timer ──
+$s = new Sys();
+foreach (["basic", "shutdown", "timers"] as $t) { $s->addFile($u . $t . ".target", "[Unit]\n"); }
+$s->addFile($u . "job.service", "[Service]\nType=oneshot\nExecStart=/bin/job\n");
+$s->addFile($u . "job.timer", "[Timer]\nOnBootSec=30s\nOnUnitActiveSec=1min\n");
+$s->addFile($u . "cal.service", "[Service]\nType=oneshot\nExecStart=/bin/cal\n");
+$s->addFile($u . "cal.timer", "[Timer]\nOnCalendar=daily\nPersistent=true\n");
+$s->addFile($u . "bad.timer", "[Timer]\nOnCalendar=nonsens\n");
+$m = mk($s, 4242);
+$m->submit("job.timer", "start", "manual");
+pump($m, 1);
+$f += eq("timer waiting", $m->runtimeFor("job.timer")->sub, "waiting");
+$f += eq("timer has next", $m->runtimeFor("job.timer")->nextWake() > 0, true);
+pump($m, 1);
+$f += eq("nothing before due", count($s->spawned), 0);
+$s->advance(31000);
+pump($m, 2);
+$f += eq("timer fired service", $s->lastSpawn()["path"], "/bin/job");
+$s->exitProc($m->runtimeFor("job.service")->controlPid, 0);
+pump($m, 2);
+$f += eq("oneshot done", $m->runtimeFor("job.service")->state, "inactive");
+$n0 = count($s->spawned);
+$s->advance(30000);
+pump($m, 2);
+$f += eq("no refire at +30s", count($s->spawned), $n0);
+$s->advance(31000);
+pump($m, 2);
+$f += eq("refire OnUnitActiveSec", count($s->spawned), $n0 + 1);
+$m->submit("cal.timer", "start", "manual");
+pump($m, 1);
+$ct = $m->runtimeFor("cal.timer");
+$f += eq("calendar timer armed", $ct->nextReal > $s->realMs(), true);
+$m->submit("bad.timer", "start", "manual");
+pump($m, 1);
+$f += eq("bad calendar fails", $m->runtimeFor("bad.timer")->state, "failed");
+
+# ── PID 1: zamykanie wywołuje reboot(2) ──
+$s = new Sys();
+foreach (["basic", "shutdown"] as $t) { $s->addFile($u . $t . ".target", "[Unit]\n"); }
+$s->addFile($u . "x.service", "[Service]\nExecStart=/bin/x\n");
+$m = mk($s, 1);
+$f += eq("isPid1", $m->cfg->isPid1, true);
+$m->submit("x.service", "start", "manual");
+pump($m, 2);
+$f += eq("x active", $m->runtimeFor("x.service")->state, "active");
+$m->beginShutdown("reboot");
+$i = 0;
+while ($s->rebooted == "" && $i < 40) { pump($m, 1); $i += 1; }
+$f += eq("reboot(2) requested", $s->rebooted, "reboot");
+$f += eq("signals all procs", count($s->kills) > 0, true);
+
+# ── ctl offline / online ──
+$s = new Sys();
+$s->addFile($u . "svc.service", "[Unit]\nDescription=S\n[Service]\nExecStart=/bin/s\n[Install]\nWantedBy=multi-user.target\n");
+$s->addFile($u . "multi-user.target", "[Unit]\n");
+$s->pidVal = 4242;
+$cfg = config.load($s, "system", ["HOME" => "/root"]);
+$c = new Ctl($s, $cfg);
+$f += eq("enable offline rc", $c->run(["enable", "svc.service", "--no-reload", "-q"]), 0);
+$f += eq("enable created link", $s->exists("/etc/zenit/system/multi-user.target.wants/svc.service"), true);
+$f += eq("is-enabled rc", $c->run(["is-enabled", "svc", "-q"]), 0);
+$f += eq("disable rc", $c->run(["disable", "svc", "--no-reload", "-q"]), 0);
+$f += eq("is-enabled after disable", $c->run(["is-enabled", "svc", "-q"]), 1);
+$f += eq("mask rc", $c->run(["mask", "svc", "--no-reload", "-q"]), 0);
+$f += eq("masked", $s->readlink("/etc/zenit/system/svc.service"), "/dev/null");
+$f += eq("unmask rc", $c->run(["unmask", "svc", "--no-reload", "-q"]), 0);
+$f += eq("set-default", $c->run(["set-default", "multi-user.target", "-q"]), 0);
+$f += eq("get-default", $c->loader->defaultTarget(), "multi-user.target");
+$f += eq("start offline fails", $c->run(["start", "svc"]), 1);
+$f += eq("is-active offline = 3", $c->run(["is-active", "svc", "-q"]), 3);
+$f += eq("unknown command", $c->run(["wat"]), 1);
+$f += eq("cat rc", $c->run(["cat", "svc"]), 0);
+$f += eq("list-unit-files rc", $c->run(["list-unit-files", "--no-legend"]), 0);
+$s->canned = "3\t9\ninactive\n";
+$f += eq("online is-active passes code", $c->run(["is-active", "svc", "-q"]), 3);
+$f += eq("connects to control socket", $s->lastConnect, "/run/zenit/control");
+$s->canned = "0\t0\n";
+$f += eq("online start ok", $c->run(["start", "svc"]), 0);
+$s->canned = "1\t12\nbrak jednak\n";
+$f += eq("online start error code", $c->run(["start", "svc"]), 1);
+$o = ctl.parseArgs(["--user", "-t", "service", "status", "-n", "5", "foo", "--no-pager", "-p", "MainPID,ActiveState", "--value"]);
+$f += eq("parse cmd", $o->cmd, "status");
+$f += eq("parse pos", join($o->pos, ","), "foo");
+$f += eq("parse -n", $o->lines, 5);
+$f += eq("parse props", join($o->props, ","), "MainPID,ActiveState");
+$f += eq("parse user", $o->user, true);
+$f += eq("parse type", $o->types, "service");
+
+# ── compat ──
+$f += eq("prioNum name", compat.prioNum("err"), 3);
+$f += eq("prioNum num", compat.prioNum("5"), 5);
+$f += eq("shutdown now", compat.shutdownDelay($s, "now"), 0);
+$f += eq("shutdown +5", compat.shutdownDelay($s, "+5"), 300);
+$f += eq("shutdown bad", compat.shutdownDelay($s, "kiedys"), null);
+$f += eq("since -1h", compat.parseSince($s, "-1h"), $s->realMs() - 3600000);
+$f += eq("since date", compat.parseSince($s, "2026-11-21 13:00:00"), $s->mktime(2026, 11, 21, 13, 0, 0) * 1000);
+$f += eq("journalctl rc", compat.journalctl($s, $cfg, ["-u", "svc", "-n", "5", "--no-pager"]), 0);
+$f += eq("dispatch unknown", compat.dispatch($s, $cfg, "nic", []), -1);
+$f += eq("telinit bad", compat.telinit($s, $cfg, ["9"]), 1);
+
+# ── config ──
+$f += eq("cmdline single", config.targetFromCmdline("quiet single", "multi-user.target"), "rescue.target");
+$f += eq("cmdline unit", config.targetFromCmdline("zenit.unit=graphical", "multi-user.target"), "graphical.target");
+$f += eq("cmdline default", config.targetFromCmdline("ro quiet", "multi-user.target"), "multi-user.target");
+exit($f);

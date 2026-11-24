@@ -146,8 +146,9 @@ func runDaemon($sys, $args) {
     if ($unit != "") { $target = util.normalizeName($unit); }
     $m->startBoot($target);
     $code = $m->loop();
-    if ($cfg->isPid1) {
-        # PID 1 nigdy nie kończy działania — jeśli pętla zwróciła, czekamy na jądro
+    if ($cfg->isPid1 && !$cfg->container) {
+        # PID 1 systemu nigdy nie kończy działania — jeśli pętla zwróciła, czekamy na jądro
+        # (PID 1 kontenera kończy się kodem wyjścia: 0 = poweroff/halt, 2 = reboot)
         while (true) { $sys->sleepMs(1000); $m->reapAll(); }
     }
     return $code;
@@ -155,7 +156,8 @@ func runDaemon($sys, $args) {
 
 func main() {
     $sys = new Sys();
-    $args = System.args();
+    # System.args()[0] to ścieżka programu/skryptu — argumenty użytkownika zaczynają się od [1]
+    $args = util.drop_first(System.args());
     $name = argv0($sys);
     if (count($args) > 0 && starts_with($args[0], "--applet=")) {
         $name = substr($args[0], 9, strlen($args[0]) - 9);

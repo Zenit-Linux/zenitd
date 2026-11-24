@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HERE/tests"
 export ZS_WORKSPACE="$HERE/tests/fake"
 total=0; bad=0
-for t in t_util t_core t_exec t_manager t_more t_units; do
+for t in t_util t_core t_exec t_manager t_more t_units t_cycle; do
     out="$(timeout 300 "$ZSC0" run "$t.zsharp" 2>&1)"; rc=$?
     ok=$(printf '%s\n' "$out" | grep -c '^ok')
     fl=$(printf '%s\n' "$out" | grep -c '^FAIL')

@@ -54,6 +54,23 @@ func onCycle($preds, $done, $start) {
     return false;
 }
 
+# czy z $from da się dojść (po nieukończonych poprzednikach) do $target
+func reaches($preds, $done, $from, $target) {
+    $seen = [$from];
+    $queue = [$from];
+    $qi = 0;
+    while ($qi < count($queue)) {
+        $cur = $queue[$qi];
+        $qi += 1;
+        foreach ($preds[$cur] as $p) {
+            if ($done[$p]) { continue; }
+            if ($p == $target) { return true; }
+            if (!util.contains_item($seen, $p)) { $seen[] = $p; $queue[] = $p; }
+        }
+    }
+    return false;
+}
+
 # Sortowanie topologiczne po After/Before w obrębie $members. Cykle łamane z ostrzeżeniem.
 # Zwraca ["order" => [...], "warnings" => [...]]
 func order($reg, $members) {
@@ -82,6 +99,7 @@ func order($reg, $members) {
     while ($i < $n) { $done[] = false; $i += 1; }
     $out = [];
     $warnings = [];
+    $broken = [];     # krawędzie przerwane przy cyklach: [kto czekałby, na kogo]
     while (count($out) < $n) {
         $progress = false;
         $i = 0;
@@ -111,11 +129,14 @@ func order($reg, $members) {
                 while ($i < $n) { if (!$done[$i]) { $best = $i; break; } $i += 1; }
             }
             $warnings[] = "cykl porządku zależności przerwany na " . $members[$best];
+            foreach ($preds[$best] as $p) {
+                if (!$done[$p] && ($p == $best || reaches($preds, $done, $p, $best))) { $broken[] = [$members[$best], $members[$p]]; }
+            }
             $done[$best] = true;
             $out[] = $members[$best];
         }
     }
-    return ["order" => $out, "warnings" => $warnings];
+    return ["order" => $out, "warnings" => $warnings, "broken" => $broken];
 }
 
 # Plan startu. Zwraca:
@@ -124,7 +145,7 @@ func order($reg, $members) {
 func planStart($reg, $root) {
     $c = closure($reg, $root);
     $plan = ["start" => [], "stop" => [], "weak" => $c["weak"], "requisite" => $c["requisite"],
-             "errors" => $c["errors"], "warnings" => $c["warnings"]];
+             "errors" => $c["errors"], "warnings" => $c["warnings"], "broken" => []];
     if (count($c["errors"]) > 0) { return $plan; }
     $members = $c["members"];
     $stops = [];
@@ -145,6 +166,7 @@ func planStart($reg, $root) {
     $o = order($reg, $members);
     $plan["start"] = $o["order"];
     foreach ($o["warnings"] as $w) { $plan["warnings"][] = $w; }
+    $plan["broken"] = $o["broken"];
     $plan["stop"] = $stops;
     return $plan;
 }
@@ -174,7 +196,9 @@ func planStop($reg, $root) {
     $rev = [];
     $i = count($o["order"]) - 1;
     while ($i >= 0) { $rev[] = $o["order"][$i]; $i -= 1; }
-    return ["stop" => $rev, "warnings" => $o["warnings"]];
+    $sb = [];
+    foreach ($o["broken"] as $e) { $sb[] = [$e[1], $e[0]]; }   # przy stopie kolejność odwrócona
+    return ["stop" => $rev, "warnings" => $o["warnings"], "broken" => $sb];
 }
 
 # Dla `list-dependencies`: drzewo zależności jako lista [głębokość, nazwa]

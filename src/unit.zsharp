@@ -138,6 +138,16 @@ func build($name, $sections, $path, $ctx) {
         foreach ($s["items"] as $it) {
             $key = $it[0];
             $val = $it[1];
+            # zgodność z systemd: limity startów w [Service] (starsze pliki jednostek) należą do [Unit]
+            if ($sn == "Service" && ($key == "StartLimitBurst" || $key == "StartLimitInterval" || $key == "StartLimitIntervalSec")) {
+                if ($key == "StartLimitInterval") { $key = "StartLimitIntervalSec"; }
+                $ucur = $sec["Unit"] ?? [];
+                $ul = $ucur[$key] ?? [];
+                if ($val == "") { $ul = []; } else { $ul[] = util.specifiers($val, $ctx); }
+                $ucur[$key] = $ul;
+                $sec["Unit"] = $ucur;
+                continue;
+            }
             if (!isKnown($sn, $key)) {
                 $u->warnings[] = "nieznana dyrektywa " . $sn . "/" . $key . " (linia " . strval($it[2]) . ")";
             }

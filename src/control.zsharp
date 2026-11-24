@@ -193,8 +193,22 @@ class Control {
             return [0, ""];
         }
         $ids = [];
-        foreach ($jobs as $j) { $ids[] = $j->id; $j->waiters[] = $fd; }
-        $this->conns[$fd]["wait"] = ["ids" => $ids, "failed" => [], "errors" => $errors];
+        $failed = [];
+        foreach ($jobs as $j) {
+            # submit() uruchamia zadania synchronicznie — zadanie mogło się już zakończyć (result != ""),
+            # a wtedy nikt nie wywoła jobFinished dla tego klienta
+            if ($j->result != "") {
+                if ($j->result == "failed" || $j->result == "dependency" || $j->result == "timeout" || $j->result == "canceled" || $j->result == "refused") {
+                    $failed[] = [$j->unit, $j->result];
+                }
+                continue;
+            }
+            $ids[] = $j->id;
+            $j->waiters[] = $fd;
+        }
+        $w = ["ids" => $ids, "failed" => $failed, "errors" => $errors];
+        if (count($ids) == 0) { $this->finishWait($fd, $w); return null; }
+        $this->conns[$fd]["wait"] = $w;
         return null;
     }
 

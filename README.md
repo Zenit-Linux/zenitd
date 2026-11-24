@@ -49,6 +49,9 @@ Konfiguracja: `/etc/zenit/zenit.conf` (zob. `data/conf/zenit.conf`). Jednostki: 
 
 ## Budowanie i instalacja
 
+Testy: `ZSC0=… scripts/test.sh` (logika, fałszywy `Sys`) oraz `ZENITD=… scripts/live-test.sh` (prawdziwa libc/jądro, tryb `--user`).
+Binarka standalone: `zsc build src/main.zsharp --emit zbc -o zenitd.zbc && zsc0 bundle zenitd.zbc -o zenitd`.
+
 ```
 z# build --release          # target/release/zenitd (wejście: src/main.zsharp)
 DESTDIR=/tmp/rootfs scripts/install.sh

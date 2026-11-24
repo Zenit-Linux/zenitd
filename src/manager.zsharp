@@ -37,6 +37,7 @@ class Manager {
     public $pidmap = [];
     public $fdmap = [];
     public $jobs = [];
+    public $ignoreWait = [];     # "A|B": zadanie A nie czeka na B (krawędź przerwana przy cyklu porządku)
     public $jobOrder = [];
     public $jobSeq = 0;
     public $epfd = -1;
@@ -231,6 +232,7 @@ class Manager {
         }
         if ($type == "stop") {
             $plan = graph.planStop($this, $name);
+            foreach ($plan["broken"] as $e) { $this->ignoreWait[$e[0] . "|" . $e[1]] = true; }
             foreach ($plan["stop"] as $n) {
                 $rt = $this->runtimes[$n] ?? null;
                 if ($rt != null && ($rt->isRunning() || ($rt->state == "failed" && $n == $name))) { $this->addJob($n, "stop", $reason); }
@@ -257,6 +259,7 @@ class Manager {
         foreach ($plan["errors"] as $e) { $res["errors"][] = $e; }
         foreach ($plan["warnings"] as $w) { $res["warnings"][] = $w; $this->warn($w); }
         if (count($res["errors"]) > 0) { return $res; }
+        foreach ($plan["broken"] as $e) { $this->ignoreWait[$e[0] . "|" . $e[1]] = true; }
         foreach ($plan["stop"] as $n) {
             $rt = $this->runtimes[$n] ?? null;
             if ($rt != null && $rt->isRunning()) { $this->addJob($n, "stop", "konflikt z " . $name); }
@@ -294,12 +297,14 @@ class Manager {
                     if (util.contains_item($u->conflicts, $k->unit) || util.contains_item($ku->conflicts, $j->unit)) { return true; }
                 } else {
                     # k startuje wcześniej: j After k albo k Before j
-                    if (util.contains_item($u->after, $k->unit) || util.contains_item($ku->before, $j->unit)) { return true; }
+                    if ((util.contains_item($u->after, $k->unit) || util.contains_item($ku->before, $j->unit))
+                        && !($this->ignoreWait[$j->unit . "|" . $k->unit] ?? false)) { return true; }
                 }
             } else {
                 if ($kStopping) {
                     # k startowało po j (k After j) => k musi się zatrzymać pierwsze
-                    if (util.contains_item($ku->after, $j->unit) || util.contains_item($u->before, $k->unit)) { return true; }
+                    if ((util.contains_item($ku->after, $j->unit) || util.contains_item($u->before, $k->unit))
+                        && !($this->ignoreWait[$j->unit . "|" . $k->unit] ?? false)) { return true; }
                 }
             }
         }
@@ -639,7 +644,7 @@ class Manager {
                 $this->iterate($this->computeTimeout());
             } catch (Throwable $e) {
                 # PID 1 nie może paść: zapisz błąd i kontynuuj
-                $this->err("Wyjątek w pętli głównej: " . $e->getMessage());
+                $this->err("Wyjątek w pętli głównej: " . $e->getMessage() . " (linia " . strval($e->line ?? 0) . ")");
                 $this->sys->sleepMs(50);
             }
         }

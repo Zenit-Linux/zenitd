@@ -98,6 +98,7 @@ func journalctl($sys, $cfg, $args) {
         }
         elseif (starts_with($a, "--since=")) { $t = parseSince($sys, substr($a, 8, strlen($a) - 8)); if ($t != null) { $since = $t; } }
         elseif ($a == "--no-pager" || $a == "-q" || $a == "--quiet" || $a == "-x" || $a == "-e" || $a == "--utc" || $a == "--no-hostname" || $a == "-a" || $a == "--all") { }
+        elseif ($a == "--user" || $a == "--system") { }
         elseif ($a == "--version") { necho("journalctl (zenitd 0.1.0)\n"); return 0; }
         elseif (starts_with($a, "-")) { eecho("journalctl: nieznana opcja " . $a); return 1; }
         else { $units[] = util.normalizeName($a); }

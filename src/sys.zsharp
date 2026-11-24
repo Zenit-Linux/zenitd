@@ -653,7 +653,12 @@ class Sys {
         }
         if ($pid == 0) {
             close($pp[0]);
-            $this->childMain($spec, $argv, $envp, $pp[1]);
+            # dziecko nigdy nie może wrócić do pętli demona: każdy wyjątek kończy się _exit
+            try {
+                $this->childMain($spec, $argv, $envp, $pp[1]);
+            } catch (Throwable $e) {
+                $this->childFail($pp[1], "exception");
+            }
             _exit(127);
         }
         close($pp[1]);
@@ -750,8 +755,9 @@ class Sys {
             $res = $this->rlimitResource($l[0]);
             if ($res >= 0) {
                 $rl = $m->alloc(16);
-                $m->poke64($rl, $l[1]);
-                $m->poke64($rl + 8, $l[2]);
+                # wartości z execspec to napisy; "inf" = RLIM_INFINITY (same jedynki)
+                $m->poke64($rl, ($l[1] == "inf") ? -1 : intval($l[1]));
+                $m->poke64($rl + 8, ($l[2] == "inf") ? -1 : intval($l[2]));
                 if (mem.i32(setrlimit($res, $rl)) < 0) { $this->childFail($w, "rlimit"); }
             }
         }

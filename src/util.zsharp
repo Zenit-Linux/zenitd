@@ -186,10 +186,13 @@ func expandVars($s, $env) {
         if ($d == "{") {
             $j = $i + 2;
             while ($j < $n && substr($s, $j, 1) != "}") { $name = $name . substr($s, $j, 1); $j += 1; }
+            if ($j >= $n) { $out = $out . substr($s, $i, $n - $i); $i = $n; continue; }
             $i = $j + 1;
         } else {
             $j = $i + 1;
-            while ($j < $n && is_alnum(substr($s, $j, 1))) { $name = $name . substr($s, $j, 1); $j += 1; }
+            while ($j < $n && (is_alnum(substr($s, $j, 1)) || substr($s, $j, 1) == "_")) { $name = $name . substr($s, $j, 1); $j += 1; }
+            # `$` bez nazwy (np. `$(cmd)`) zostaje dosłownie — jak w systemd
+            if ($name == "") { $out = $out . "$"; $i += 1; continue; }
             $i = $j;
         }
         $out = $out . ($env[$name] ?? "");

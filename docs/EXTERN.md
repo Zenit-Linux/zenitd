@@ -36,7 +36,8 @@ jednowątkowego runtime Z# i niczego nieflushowanego w buforach stdout przed for
 | Logika (ini, jednostki, graf, kalendarz, silnik zadań, usługi, sockety, timery, dziennik, ctl, protokół) | 243 asercje w interpreterze stage0, fałszywy `Sys` |
 | Zgodność z natywnym backendem Z# | `scripts/native-check.sh`: linker + `ir.lower` → zero problemów poza samym `extern` |
 | Triki pamięciowe i offsety struktur | ctypes na x86_64/glibc |
-| `src/sys.zsharp` na prawdziwej libc/jądrze | **brak testu automatycznego** — backend natywny tej wersji Z# nie linkuje jeszcze `extern`. Pierwszy rozruch w QEMU/kontenerze to właściwy test; zacznij od `zenitd --user` albo kontenera |
+| `src/sys.zsharp` na prawdziwej libc/jądrze | `scripts/live-test.sh`: 12 sprawdzeń na żywo w trybie `--user` (interpreter stage0 z `ffi.rs` albo bundle `.zbc`): start/stop/restart, grupa procesów, rlimity, start-limit, oneshot, journalctl, aktywacja gniazdem, timer. `scripts/vm/run.sh`: zenitd jako PID 1 na prawdziwym jądrze w QEMU (cgroup v2, notify, forking, `reboot(2)`, poweroff — 23/23). Dodatkowo ręcznie: PID 1 w przestrzeni PID (`unshare --pid --fork --mount-proc`, `container=docker`): `poweroff` → kod 0, `reboot` → kod 2 |
+| Natywny backend Z# | nadal nie linkuje `extern` ani klas — zenitd działa jako pakiet `.zbc` (`zsc build --emit zbc` + `zsc0 bundle`) |
 
-Gdy extern będzie działać: uruchom najpierw tryb kontenerowy (`docker run --init=false ... /usr/lib/zenit/zenitd`),
+Następny krok: uruchom najpierw tryb kontenerowy (`docker run --init=false ... /usr/lib/zenit/zenitd`),
 potem QEMU z `init=/sbin/init`.
